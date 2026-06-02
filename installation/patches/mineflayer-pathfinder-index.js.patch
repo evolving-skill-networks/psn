@@ -1,0 +1,166 @@
+--- a/mineflayer-pathfinder/index.js	1985-10-26 04:15:00.000000000 -0400
++++ b/mineflayer-pathfinder/index.js	2026-04-25 04:00:00.000000000 -0400
+@@ -398,7 +398,19 @@
+   bot.on('blockUpdate', (oldBlock, newBlock) => {
+     if (!oldBlock || !newBlock) return
+     if (isPositionNearPath(oldBlock.position, path) && oldBlock.type !== newBlock.type) {
+-      resetPath('block_updated', false)
++      // PATCH (skillnet): clearStates=true (was false). When the world changes
++      // mid-plan (typical: bot just dug/placed a block on the path), the path
++      // is replanned but bot's stale motor inputs (forward/jump) used to be
++      // preserved across the reset. With postProcessPath occasionally producing
++      // multi-step waypoints (dy=2 with toBreak/toPlace dropped on inner moves),
++      // bot would continue forward into a wall the new plan would have dug —
++      // ending up corner-pinch wedged (fractional y/xz, og=False) where the
++      // dig branch (line 494) is gated and cannot fire. Clearing motor on
++      // world-change makes bot physics neutral for ~1 tick while pathfinder
++      // replans. Cost: ~2.2% slower flat walks (more motor stutter). Benefit:
++      // the obstacle-corridor case goes from ~50% timeout (false) to
++      // ~100% success (true).
++      resetPath('block_updated', true)
+     }
+   })
+ 
+@@ -417,6 +429,54 @@
+   })
+ 
+   function monitorMovement () {
++    // PATCH (skillnet, wedge escape): when bot ends up corner-pinched
++    // (og=False, fractional y, |vy|<0.2 sustained), the dig branch (line 494)
++    // is gated on og=True so bot can't progress. Force a brief 'back' input
++    // (which drives bot away from wall via Minecraft physics) and HOLD it
++    // until og=True is restored — meaning bot has landed on a stable block
++    // top — then resetPath so pathfinder re-plans from the new position.
++    // No fixed-time timeout: the 'back' lasts only as long as needed for
++    // physics to dislodge bot. Cap escapes to 10 per goto so a deterministic
++    // wedge-prone plan doesn't livelock indefinitely.
++    if (path && path.length > 0 && bot.entity && stateGoal) {
++      const yFrac = bot.entity.position.y - Math.floor(bot.entity.position.y)
++      const isWedgePos = !bot.entity.onGround && yFrac > 0.05 && yFrac < 0.95 && Math.abs(bot.entity.velocity.y) < 0.2 && !bot.entity.isInWater && !bot.entity.isInLava
++      if (isWedgePos) {
++        if (!monitorMovement._wedgeStart) monitorMovement._wedgeStart = performance.now()
++      } else {
++        monitorMovement._wedgeStart = 0
++      }
++      if (monitorMovement._wedgeStart && performance.now() - monitorMovement._wedgeStart > 1000 && !monitorMovement._escapeStart) {
++        monitorMovement._escapeCount = (monitorMovement._escapeCount || 0) + 1
++        if (monitorMovement._escapeCount > 10) {
++          stop()
++          monitorMovement._escapeCount = 0
++          monitorMovement._wedgeStart = 0
++          monitorMovement._escapeStart = 0
++          return
++        }
++        monitorMovement._escapeStart = performance.now()
++        monitorMovement._wedgeStart = 0
++        bot.clearControlStates()
++        bot.setControlState('back', true)
++        // Don't resetPath yet; let bot physics land first
++      }
++      if (monitorMovement._escapeStart) {
++        const elapsed = performance.now() - monitorMovement._escapeStart
++        // Stop 'back' as soon as bot lands (og=True), or after 1.5s safety cap
++        if (bot.entity.onGround || elapsed > 1500) {
++          bot.setControlState('back', false)
++          monitorMovement._escapeStart = 0
++          resetPath('wedge_escape')
++        } else {
++          return
++        }
++      }
++    }
++    if (stateGoal !== monitorMovement._lastGoal) {
++      monitorMovement._escapeCount = 0
++      monitorMovement._lastGoal = stateGoal
++    }
+     // Test freemotion
+     if (stateMovements && stateMovements.allowFreeMotion && stateGoal && stateGoal.entity) {
+       const target = stateGoal.entity
+@@ -516,6 +576,21 @@
+         placing = true
+         placingBlock = nextPoint.toPlace.shift()
+         fullStop()
++        // PATCH (skillnet): pre-equip scaffolding on the ground before tower-up jump.
++        // Without this, equip happens inside the ~150ms jump-peak window, where
++        // async equip + placeBlock often miss the window and the bot jumps many
++        // times before a block lands. The downstream equip() below is kept as a
++        // safety net for when this pre-equip is skipped (lock held elsewhere).
++        if (placingBlock.jump && lockEquipItem.tryAcquire()) {
++          const sb = stateMovements.getScaffoldingItem()
++          if (sb) {
++            bot.equip(sb, 'hand')
++              .catch(_ignoreError => {})
++              .finally(() => lockEquipItem.release())
++          } else {
++            lockEquipItem.release()
++          }
++        }
+       }
+ 
+       // Open gates or doors
+@@ -541,7 +616,15 @@
+       let canPlace = true
+       if (placingBlock.jump) {
+         bot.setControlState('jump', true)
+-        canPlace = placingBlock.y + 1 < bot.entity.position.y
++        // PATCH (skillnet): require bot's feet to be at least one full block
++        // ABOVE the target slot before attempting placement. The original
++        // condition `placingBlock.y + 1 < bot.y` fires the moment feet leave
++        // the node, when bot's 1.8m body still overlaps the target slot,
++        // causing the server to silently reject the placement and mineflayer
++        // to waste 5s waiting for a blockUpdate that never comes. Tightening
++        // the window to the jump peak (~3 ticks wide) makes every attempt
++        // land cleanly.
++        canPlace = placingBlock.y + 2 < bot.entity.position.y
+       }
+       if (canPlace) {
+         if (!lockEquipItem.tryAcquire()) return
+@@ -553,13 +636,47 @@
+             if (interactableBlocks.includes(refBlock.name)) {
+               bot.setControlState('sneak', true)
+             }
+-            bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
++            // PATCH (skillnet): use _placeBlockWithOptions with forceLook:true.
++            // The 2-arg form bot.placeBlock(...) routes through _genericPlace which
++            // does an awaited bot.lookAt(target, undefined) — smooth interpolation.
++            // When the previous move dug a horizontal block (yaw rotated 90/180°),
++            // smooth lookAt takes ~1s (21 physicsTicks) to converge. During that
++            // 1s, bot falls from jump apex back to ground; by the time block_place
++            // packet sends, bot's body is inside the dest cell and the server
++            // silent-rejects (no blockUpdate). mineflayer then waits 5s on the
++            // blockUpdate it'll never get, holding lockPlaceBlock the whole time
++            // — which manifests as bot bouncing in place and pathfinder hitting
++            // its own 5s thinkTimeout. forceLook:true makes lookAt instant
++            // (single tick), so the place packet sends in the same tick canPlace
++            // was checked, while bot is still at apex. (Validated against a
++            // tower-up reproducer: lookAt converges in 0ms and every placeBlock
++            // resolves in <1ms with no bouncing.)
++            bot._placeBlockWithOptions(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz), { swingArm: 'right', forceLook: true })
+               .then(function () {
+                 // Dont release Sneak if the block placement was not successful
+                 bot.setControlState('sneak', false)
+                 if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
+               })
+               .catch(_ignoreError => {
++                // PATCH (skillnet): mineflayer's placeBlock sometimes times out
++                // waiting for a blockUpdate event even though the placement
++                // succeeded on the server (common during tower-up: bot moves
++                // out of the target slot before the event arrives). Before
++                // treating this as a hard failure and re-planning (expensive
++                // A* replan that causes the bot to hover + re-jump for ~5s
++                // per missed event), probe the world to see if the target
++                // block actually exists. If it does, treat as success.
++                const target = new Vec3(
++                  placingBlock.x + placingBlock.dx,
++                  placingBlock.y + placingBlock.dy,
++                  placingBlock.z + placingBlock.dz
++                )
++                const placed = bot.blockAt(target, false)
++                if (placed && placed.boundingBox === 'block') {
++                  bot.setControlState('sneak', false)
++                  if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
++                  return
++                }
+                 resetPath('place_error')
+               })
+               .then(() => {

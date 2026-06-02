@@ -1,0 +1,113 @@
+ckpt*
+examples*
+!examples/
+!examples/psn_quickstart.py
+logs*
+*.md
+!CLAUDE.md
+!docs/**/*.md
+!/README.md
+!/AGENTS.md
+!/installation/*.md
+*.txt
+!requirements.txt
+!skillnet/agents/optimizer/prompts/*.txt
+!skillnet/domains/minecraft/prompts/*.txt
+!skillnet/agents/refactor/prompts/*.txt
+*.tex
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+venv/
+env.bak/
+venv.bak/
+
+# IDE
+.idea
+.spyderproject
+.spyproject
+.ropeproject
+
+# mypy
+.mypy_cache/
+
+# Mac
+.DS_Store
+
+# Locally generated files
+*.local.ipynb
+runs/
+/temp*
+debug_*
+*.swp
+
+# Node
+node_modules/
+
+# LaTeX build artifacts (keep .tex/.bib/.pdf source, drop intermediates)
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+
+# Headless Fabric server working dir (created by installation/setup_fabric_server.sh).
+# Contains the Fabric installer/launcher jar, world data, EULA, logs, PID file,
+# etc. — all user-specific and large; never commit.
+/installation/fabric_server/
+
+# Claude Code agent-local memory (not part of the project)
+.claude/

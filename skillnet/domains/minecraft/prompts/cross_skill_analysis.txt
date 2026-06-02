@@ -1,0 +1,22 @@
+Below are recent skill execution failures from a Minecraft bot agent. The task "{triggering_task}" has just triggered escalation after repeated optimization failures.
+
+Recent failures:
+{failure_records}
+
+Analyze these failures:
+1. Is there a common root cause across multiple failures (not just the triggering task)?
+2. If so, is this solvable by modifying individual skills, or does it require a systemic solution?
+3. If systemic, what type of action is needed?
+   (a) Learn a new prerequisite skill (describe what capability is missing)
+   (b) Change environment/location (describe what environment is needed)
+   (c) The current approach has a fundamental flaw (describe the flaw)
+
+Return a JSON object with these fields:
+{{
+  "pattern_detected": true/false,
+  "common_cause": "description of common cause (empty if no pattern)",
+  "systemic_action": "none" | "learn_prerequisite" | "change_environment" | "approach_flaw",
+  "proposed_capability": "description of what's needed (empty if no pattern)"
+}}
+
+Return ONLY the JSON object, no other text.

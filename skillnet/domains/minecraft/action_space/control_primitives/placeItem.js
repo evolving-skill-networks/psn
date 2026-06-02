@@ -1,0 +1,134 @@
+// Use helper functions from adaptive_helpers.js (loaded into the global scope via control primitives)
+// - pillarUp(bot, item)  — place a block at the bot's foot by jumping + placing below
+// Vec3 / GoalPlaceBlock / gotoWithTimeout are provided by the /step scope; do not redeclare.
+
+async function placeItem(bot, name, position) {
+    // name must be a string
+    if (typeof name !== "string") {
+        throw new Error(`name for placeItem must be a string`);
+    }
+    // Defensively convert plain {x, y, z} objects to Vec3
+    if (!(position instanceof Vec3)) {
+        if (position && typeof position.x === 'number' && typeof position.y === 'number' && typeof position.z === 'number') {
+            position = new Vec3(position.x, position.y, position.z);
+        } else {
+            throw new Error(`position for placeItem must be a Vec3 or {x, y, z}`);
+        }
+    }
+    position = position.floored();
+    const itemByName = mcData.itemsByName[name];
+    if (!itemByName) {
+        throw new Error(`No item named ${name}`);
+    }
+    const item = bot.inventory.findInventoryItem(itemByName.id);
+    if (!item) {
+        bot.chat(`No ${name} in inventory`);
+        throw new Error(`No ${name} in inventory for placing`);
+    }
+    const item_count = item.count;
+
+    // ===== Strategy A: the target is a cell the bot occupies (its foot or head) =====
+    // Handing an occupied target to GoalPlaceBlock makes the pathfinder tower-up + dig
+    // in a loop (it can never stand at a cell it must keep clear). Place AT the target by
+    // pillaring up instead: jump to vacate the foot and place on the floor below. The head
+    // cell reduces to the foot case after one filler pillar.
+    const foot = bot.entity.position.floored();
+    const head = foot.offset(0, 1, 0);
+    const occupiesFoot = position.equals(foot);
+    const occupiesHead = position.equals(head);
+    // Foot needs no scaffolding (the item itself is the pillar block). Head needs a filler
+    // to raise the bot one level first — only feasible if scaffolding is on hand. Without
+    // scaffolding the pathfinder can't tower-up (so it won't thrash); fall through to
+    // Strategy B, which places an occupied head by digging a reachable face.
+    let usePillarUp = occupiesFoot;
+    if (occupiesHead) {
+        const mv = bot.pathfinder && bot.pathfinder.movements;
+        const scaffold = (mv && typeof mv.getScaffoldingItem === "function") ? mv.getScaffoldingItem() : null;
+        usePillarUp = !!scaffold;
+    }
+    if (usePillarUp) {
+        bot.chat(`Target ${position} is the bot's ${occupiesFoot ? "foot" : "head"} cell; pillaring up to place ${name}`);
+        // Raise the bot with filler blocks until its foot reaches the target level. An
+        // occupied target is at most one above the foot, so this runs at most once; cap
+        // iterations to guarantee termination (no runaway tower).
+        let guard = 0;
+        while (bot.entity.position.floored().y < position.y) {
+            if (guard++ >= 2) {
+                throw new Error(`Failed to place ${name}: could not pillar up to target ${position}`);
+            }
+            await pillarUp(bot);   // filler from getScaffoldingItem()
+        }
+        // The bot's foot is now at the target cell; pillar-up-place the item itself there.
+        // A throw here still falls through to the blockAt/item-count reconciliation below
+        // (symmetric with Strategy B's false-negative handling).
+        try {
+            await pillarUp(bot, item);
+        } catch (e) {
+            // verified by the world-state / item-count checks below
+        }
+        const placed = bot.blockAt(position);
+        if (placed && placed.name === name) {
+            bot.chat(`Placed ${name}`);
+            return;
+        }
+        // false-negative tolerance: item consumed -> placement actually succeeded
+        const afterItem = bot.inventory.findInventoryItem(itemByName.id);
+        if (!afterItem || afterItem.count < item_count) {
+            bot.chat(`Placed ${name}`);
+            return;
+        }
+        throw new Error(`Failed to place ${name} at occupied target ${position}`);
+    }
+
+    // ===== Strategy B: place against a reference block =====
+    // Reached for a non-occupied target, OR an occupied head with no scaffolding to pillar
+    // with. In the latter case the pathfinder cannot tower-up, so GoalPlaceBlock will not
+    // thrash — it digs a reachable face and places.
+    const faceVectors = [
+        new Vec3(0, 1, 0),
+        new Vec3(0, -1, 0),
+        new Vec3(1, 0, 0),
+        new Vec3(-1, 0, 0),
+        new Vec3(0, 0, 1),
+        new Vec3(0, 0, -1),
+    ];
+    let referenceBlock = null;
+    let faceVector = null;
+    for (const vector of faceVectors) {
+        const block = bot.blockAt(position.minus(vector));
+        if (block?.name !== "air") {
+            referenceBlock = block;
+            faceVector = vector;
+            bot.chat(`Placing ${name} on ${block.name} at ${block.position}`);
+            break;
+        }
+    }
+    if (!referenceBlock) {
+        // No solid neighbour: the target is floating. Fail fast — do NOT relocate to a
+        // different cell (relocation is the caller's job, not placeItem's).
+        bot.chat(`No block to place ${name} on. You cannot place a floating block.`);
+        throw new Error(
+            `Failed to place ${name}: no valid reference block found. Cannot place a floating block.`
+        );
+    }
+
+    try {
+        // gotoWithTimeout prevents infinite blocking. The tower-up thrash only happens
+        // when the bot both occupies the target AND has scaffolding — that case went to
+        // Strategy A — so GoalPlaceBlock will not thrash here.
+        await gotoWithTimeout(bot, new GoalPlaceBlock(position, bot.world, {}), 30000, `place position for ${name}`);
+        await bot.equip(item, "hand");
+        await bot.placeBlock(referenceBlock, faceVector);
+        bot.chat(`Placed ${name}`);
+    } catch (err) {
+        const afterItem = bot.inventory.findInventoryItem(itemByName.id);
+        if (afterItem?.count === item_count) {
+            // item still in inventory -> placement really failed
+            bot.chat(`Error placing ${name}: ${err.message}, please find another position to place`);
+            throw new Error(`Failed to place ${name}: ${err.message}`);
+        } else {
+            // item count decreased -> placement actually succeeded (mineflayer API false negative)
+            bot.chat(`Placed ${name}`);
+        }
+    }
+}

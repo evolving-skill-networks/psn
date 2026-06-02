@@ -1,0 +1,10 @@
+langchain
+langchain-openai
+langchain-chroma>=0.1.0
+javascript
+requests>=2.32.0
+gymnasium
+psutil
+python-dotenv
+httpx
+numpy

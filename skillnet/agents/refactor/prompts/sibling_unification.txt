@@ -1,0 +1,32 @@
+=== SYSTEM ===
+You are a code refactoring expert. Create a general parameterized function from sibling variants.
+
+Given multiple skill variants that do similar things with different parameters, create:
+1. A general function that handles all variants via a parameter
+2. Wrapper functions for each variant
+
+Return JSON:
+{
+    "general_skill_name": "appropriateName",
+    "general_skill_code": "async function ...",
+    "general_skill_description": "...",
+    "param_name": "parameterName",
+    "wrappers": {
+        "skillName1": "async function skillName1(bot) { ... }",
+        "skillName2": "async function skillName2(bot) { ... }"
+    },
+    "param_values": {
+        "skillName1": "value1",
+        "skillName2": "value2"
+    }
+}
+
+=== HUMAN ===
+Sibling skills (pattern: {pattern}):
+
+{skills_info}
+
+Identified variants: {variants}
+Suggested parameter name: {suggested_param_name}
+
+Create a general function and wrappers for these siblings.

@@ -1,0 +1,108 @@
+You are a code analysis expert. Extract parameter information from JavaScript function code.
+
+{function_hint}
+
+Return ONLY a JSON object in this format:
+{{
+  "parameters": {{
+    "paramName": {{
+      "type": "number|string|boolean|array|object",
+      "default": default_value,
+      "description": "parameter description",
+      "semantic": "target_total|delta|config",  // REQUIRED for numeric params
+      "state_mapping": {{  // For params that map to game state (string/item-type params)
+        "source": "effect|precondition|config",
+        "field": "item|count",
+        "transform": "infer_input|null"
+      }},
+      "supported_values": [value1, value2, ...],  // Only for type arrays (e.g., log types, item types)
+      "schema": {{  // Only for object type parameters
+        "fieldName": {{
+          "type": "string|number|boolean",
+          "default": field_default_value,
+          "source_hint": {{
+            "effect_field": "item|count|type",
+            "transform": "extract_ore_base|extract_log_base|extract_planks_base|extract_ingot_base|extract_raw_base|extract_base|null"
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+
+Important:
+- Skip the '{entry_parameter}' parameter (the implicit first parameter passed to all skill functions)
+- For array types, include the default value as a JSON array
+- For string types, include quotes in the default value
+- For ANY array parameter with a non-empty default value list, set supported_values to that list
+  - This includes: logTypes, allowedLogTypes, itemTypes, fuelPriority, toolPreference, materialList, blockTypes, etc.
+  - Example 1: allowedLogTypes = ["oak_log", "birch_log", ...] → supported_values: ["oak_log", "birch_log", ...]
+  - Example 2: fuelPriority = ["coal", "charcoal", "birch_planks"] → supported_values: ["coal", "charcoal", "birch_planks"]
+  - This is CRITICAL for config/priority/preference parameters to enable proper validation
+- Provide clear, concise descriptions
+
+CRITICAL - Parameter Semantic (for numeric params like count, amount, num, quantity):
+- "target_total": the parameter means "ensure at least this many in inventory"
+  * Function returns early if already have >= count (look for patterns like "if (have >= count)" or "I already have")
+  * Example: ensurePlanks(bot, 8) = "make sure I have 8 planks total"
+- "delta": the parameter means "produce this many additional items"
+  * Function always produces the specified amount regardless of current inventory
+  * Example: craftPlanks(bot, 4) = "craft 4 new planks"
+- "config": use for non-quantity parameters (strings, arrays, objects, etc.)
+
+CRITICAL - State Mapping (for string/item-type params that relate to game state):
+state_mapping tells the planner HOW to derive this parameter's value from effects/preconditions.
+- "source": where the mapping comes from:
+  * "effect" = parameter relates to skill OUTPUT (what the skill produces)
+  * "precondition" = parameter relates to skill INPUT (what the skill needs)
+  * "config" = parameter is pure configuration (not derived from state)
+- "field": which effect/precondition field to read:
+  * "item" for item name parameters
+  * "count" for quantity parameters
+- "transform": how to convert the raw value:
+  * "infer_input" = map output product to its input material (e.g., "wooden_pickaxe" → "wooden" → planks)
+  * null = use the raw value directly
+- Only include state_mapping for string/item-type params (not numeric count params)
+- Example: craftAxe(bot, plankName="oak_planks")
+  The effect is {{item: "wooden_axe"}}. plankName is the INPUT material, so:
+  state_mapping: {{"source": "effect", "field": "item", "transform": "infer_input"}}
+  This means: read "item" from effect → "wooden_axe" → transform to input → "wooden" → resolve to planks
+- Example: mineBlock(bot, blockType="oak_log")
+  The effect is {{item: "oak_log"}}. blockType is the OUTPUT itself, so:
+  state_mapping: {{"source": "effect", "field": "item"}}
+- Example: goToLocation(bot, x=100, y=64, z=200)
+  x/y/z are pure config, no state_mapping needed
+
+For OBJECT type parameters (e.g., options = {{}}):
+- Search function body for destructuring: const {{ field1, field2 = default }} = paramName
+- For each destructured field, determine source_hint based on semantic meaning:
+  - Ore type fields (oreBase, oreType, mineralName, targetOre): effect_field="item", transform="extract_ore_base"
+  - Log type fields (logType, woodType, treeType): effect_field="item", transform="extract_log_base"
+  - Planks type fields (plankType, woodType): effect_field="item", transform="extract_planks_base"
+  - Count/quantity fields (count, quantity, amount, num): effect_field="count", transform=null
+  - Generic type extraction (other item-based fields): effect_field="item", transform="extract_base"
+  - If unsure, use transform=null to pass the value directly
+
+Examples:
+
+1. Numeric delta semantic:
+   Function: async function craftPlanks(bot, count = 4)
+   Output: {{"parameters": {{"count": {{"type": "number", "default": 4, "semantic": "delta"}}}}}}
+
+2. String config semantic:
+   Function: async function mineOre(bot, oreType = "iron_ore")
+   Output: {{"parameters": {{"oreType": {{"type": "string", "default": "iron_ore", "semantic": "config"}}}}}}
+
+3. Array with supported_values:
+   Function: async function smelt(bot, fuels = ["coal", "charcoal"])
+   Output: {{"parameters": {{"fuels": {{"type": "array", "default": ["coal", "charcoal"], "semantic": "config", "supported_values": ["coal", "charcoal"]}}}}}}
+
+4. String param with state_mapping (input material):
+   Function: async function craftAxe(bot, plankName = "oak_planks")
+   // Effect: produces wooden_axe. plankName is the INPUT material needed.
+   Output: {{"parameters": {{"plankName": {{"type": "string", "default": "oak_planks", "semantic": "config", "state_mapping": {{"source": "effect", "field": "item", "transform": "infer_input"}}}}}}}}
+
+5. String param with state_mapping (direct output):
+   Function: async function mineBlock(bot, blockType = "oak_log")
+   // Effect: obtains the block. blockType IS the output item.
+   Output: {{"parameters": {{"blockType": {{"type": "string", "default": "oak_log", "semantic": "config", "state_mapping": {{"source": "effect", "field": "item"}}}}}}}}

@@ -1,0 +1,34 @@
+{
+  "$schema_note": "Headless Fabric server config consumed by installation/setup_fabric_server.sh and installation/run_fabric_server.sh. Used only when launching PSN with --mc-mode=headless. For desktop / Modrinth users this file is ignored.",
+
+  "minecraft_version": "1.19.4",
+  "fabric_loader_version": "0.16.10",
+  "fabric_installer_version": "1.0.1",
+
+  "server_port": 25565,
+  "server_ip": "",
+  "online_mode": false,
+  "max_players": 4,
+  "view_distance": 10,
+  "simulation_distance": 10,
+
+  "level_name": "psn_world",
+  "level_seed": "psn",
+  "level_type": "minecraft:normal",
+  "generate_structures": true,
+
+  "gamemode": "survival",
+  "difficulty": "easy",
+  "force_gamemode": false,
+  "hardcore": false,
+  "pvp": true,
+
+  "allow_cheats": true,
+  "allow_flight": true,
+  "spawn_monsters": true,
+  "spawn_animals": true,
+  "spawn_npcs": true,
+
+  "memory_min_mb": 1024,
+  "memory_max_mb": 4096
+}

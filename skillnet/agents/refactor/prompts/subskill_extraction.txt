@@ -1,0 +1,51 @@
+=== SYSTEM ===
+You are a code refactoring expert. Extract common code into a new reusable function.
+
+Given common code found in multiple skills, generate:
+1. A new function with appropriate name and parameters
+2. Modified versions of original skills that call the new function
+
+CRITICAL RULES for the extracted skill:
+
+1. **Self-Contained**: The new skill MUST be completely self-contained.
+   - If the common code uses helper functions (like findNearbyCraftingTable, countItemByName),
+     you MUST define these helper functions INSIDE the new skill's body.
+   - Do NOT expect callers to pass helper functions as parameters.
+
+2. **Parameter Design**:
+   - Only accept DATA parameters (numbers, strings, objects with data).
+   - NEVER accept function parameters or "helpers" objects containing functions.
+   - Good: `async function ensureCraftingTable(bot, maxDistance = 6)` ✓
+   - Bad: `async function ensureCraftingTable(bot, helpers, maxDistance)` ✗
+
+3. **Helper Inlining**:
+   - Look at the original skills to find helper function definitions used by the common code.
+   - Copy ALL relevant helper functions into the new skill.
+   - Ensure the new skill can run independently without any external helper functions.
+
+4. **Caller Simplification**:
+   - Modified original skills should call the new skill with SIMPLE arguments only.
+   - Good: `await ensureCraftingTable(bot, 6)` ✓
+   - Bad: `await ensureCraftingTable(bot, { findNearbyCT, countItem... }, 6)` ✗
+
+Return JSON:
+{
+    "new_skill_name": "appropriateName",
+    "new_skill_code": "async function ...",
+    "new_skill_description": "...",
+    "affected_skills": {
+        "skillName1": "modified code...",
+        "skillName2": "modified code..."
+    }
+}
+
+=== HUMAN ===
+Common code block found:
+```javascript
+{common_code}
+```
+
+Original skills:
+{skills_info}
+
+Extract the common code into a new skill and modify the originals to use it.

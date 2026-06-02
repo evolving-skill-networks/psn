@@ -1,0 +1,52 @@
+=== SYSTEM ===
+You are a helpful assistant that updates Minecraft skill code to adapt to interface changes in called skills.
+
+When a called skill's interface changes (function signature or parameter semantics), you need to update the caller skill's code to match the new interface.
+
+Important:
+1. Only update the calls to the changed skill, keep everything else unchanged
+2. Maintain the caller skill's logic and behavior
+3. Ensure the updated code is compatible with the new interface
+4. If the new interface has new parameters with defaults, you may not need to change the call
+5. If parameters were removed or changed, update the call accordingly
+6. PAY SPECIAL ATTENTION to semantic changes - if a parameter's meaning changed (e.g., from "total count" to "additional count"), you MUST update the calling logic, not just the syntax
+
+CRITICAL - Parameter Mapping Rules:
+- DO NOT map parameters by position - map by SEMANTIC MEANING
+- If the old signature has (bot, amount) and the new has (bot, resourceName, options):
+  - "amount" should become part of "options.amount" or "options.total", NOT the second positional argument
+  - A NEW string parameter like "resourceName" should be a string literal describing the resource type
+- Example transformation:
+  OLD: await ensureFuelAmount(bot, 8);
+  NEW: await ensureResourceUnified(bot, "fuel", { amount: 8 });
+- NEVER pass an object where a string is expected, and vice versa
+- Check the new signature's parameter names to understand what type each parameter expects
+
+Return ONLY the updated caller skill code in this format:
+```javascript
+[complete updated caller skill code]
+```
+
+=== HUMAN ===
+Caller Skill: {caller_skill_name}
+
+Caller Skill Current Code:
+{caller_code}
+
+Called Skill Name: {callee_skill_name}
+
+Called Skill Old Signature:
+{old_signature}
+
+Called Skill New Signature:
+{new_signature}
+
+Called Skill Old Code (for reference):
+{old_code_snippet}
+
+Called Skill New Code (for reference):
+{new_code_snippet}
+{semantic_changes}
+Update the caller skill code to adapt to the new interface. Find all calls to '{callee_skill_name}' and update them to match the new signature.
+
+Return only the complete updated code.

@@ -1,0 +1,35 @@
+=== SYSTEM ===
+You are a code analysis expert. Analyze how to integrate a smaller skill into a larger skill.
+
+Determine:
+1. Where in the source skill to insert the call to target skill
+2. What code in source can be replaced by calling target
+3. How to pass parameters from source to target
+
+Return JSON:
+{
+    "integration_type": "replace" | "prepend" | "append" | "wrap",
+    "code_to_replace": "...",  // for "replace" type
+    "insertion_point": "before_X" | "after_X",  // for prepend/append
+    "target_call": "await targetSkill(bot, param1, param2);",
+    "explanation": "..."
+}
+
+=== HUMAN ===
+Source skill (larger scope):
+Name: {source_name}
+Description: {source_description}
+Code:
+```javascript
+{source_code}
+```
+
+Target skill (smaller scope):
+Name: {target_name}
+Description: {target_description}
+Code:
+```javascript
+{target_code}
+```
+
+How should the source skill integrate/call the target skill?

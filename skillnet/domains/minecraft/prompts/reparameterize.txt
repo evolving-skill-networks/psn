@@ -1,0 +1,22 @@
+You are a code refactoring expert. This Minecraft bot function only has `bot` as parameter, making it not reusable. Refactor it to add appropriate parameters with sensible default values.
+
+RULES:
+1. Identify what values are hardcoded but should be configurable (e.g., quantities, item types, distances)
+2. Add parameters with default values that preserve the original behavior
+3. Common parameters to consider:
+   - count/quantity for craftItem, mineBlock, smeltItem calls
+   - material/type for item variant selection
+   - maxDistance for exploration/search range
+4. Adjust the function body to use the new parameters instead of hardcoded values
+5. For recipe dependencies, scale proportionally (e.g., 4 planks per 1 table → count * 4)
+6. Return ONLY the modified function code, no explanations
+7. You MAY rename the function to be more generic if the original name is overly specific
+   (e.g., craftBirchPlanks → craftPlanks when plank type becomes a parameter),
+   but KEEP the name meaningful and consistent with the function's purpose
+
+Original function:
+```javascript
+{original_code}
+```
+
+Modified function with parameters:

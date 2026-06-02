@@ -1,0 +1,83 @@
+--- a/mineflayer/lib/plugins/place_block.js	1985-10-26 04:15:00.000000000 -0400
++++ b/mineflayer/lib/plugins/place_block.js	2026-04-24 16:55:54.831042179 -0400
+@@ -2,6 +2,41 @@
+ 
+ module.exports = inject
+ 
++// PATCH (skillnet): Diagnose why a placeBlock silently failed (server
++// accepted-but-ignored OR genuinely rejected the packet with no blockUpdate
++// event). Rationale: primitives must surface mechanistic state on failure
++// instead of opaque timeouts so the agent can reason about what went wrong.
++function _diagnosePlaceFailure (bot, refBlock, faceVector, dest) {
++  const parts = []
++  if (!bot.entity) return 'bot.entity undefined (died / disconnected)'
++  const pos = bot.entity.position
++  parts.push(`bot at (${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)})`)
++  // Is the destination cell inside the bot's bounding box? That makes the
++  // server silently reject the placement without sending any update.
++  const botXCell = Math.floor(pos.x)
++  const botZCell = Math.floor(pos.z)
++  const botFeetY = Math.floor(pos.y)
++  const botHeadY = Math.floor(pos.y + 1.8)
++  const destInBot = botXCell === dest.x && botZCell === dest.z &&
++                    dest.y >= botFeetY && dest.y <= botHeadY
++  if (destInBot) {
++    parts.push('DEST IS INSIDE BOT BOUNDING BOX (server silently rejects this)')
++  }
++  const actual = bot.blockAt(dest)
++  parts.push(`actual block at dest (${dest.x},${dest.y},${dest.z}): ${actual ? actual.name : 'null'}`)
++  if (refBlock) {
++    parts.push(`ref block: ${refBlock.name} at (${refBlock.position.x},${refBlock.position.y},${refBlock.position.z})`)
++  }
++  parts.push(`face: (${faceVector.x},${faceVector.y},${faceVector.z})`)
++  parts.push(`held: ${bot.heldItem ? bot.heldItem.name : 'empty'}`)
++  const conds = []
++  if (bot.entity.isInLava) conds.push('in_lava')
++  if (bot.entity.isInWater) conds.push('in_water')
++  if (!bot.entity.onGround) conds.push('airborne')
++  if (conds.length) parts.push(`bot state: ${conds.join(',')}`)
++  return parts.join('; ')
++}
++
+ function inject (bot) {
+   async function placeBlockWithOptions (referenceBlock, faceVector, options) {
+     const dest = referenceBlock.position.plus(faceVector)
+@@ -10,12 +45,32 @@
+ 
+     let newBlock = bot.blockAt(dest)
+     if (oldBlock.type === newBlock.type) {
+-      [oldBlock, newBlock] = await onceWithCleanup(bot, `blockUpdate:${dest}`, {
+-        timeout: 5000,
+-        // Condition to wait to receive block update actually changing the block type, in case the bot receives block updates with no changes
+-        // oldBlock and newBlock will both be null when the world unloads
+-        checkCondition: (oldBlock, newBlock) => !oldBlock || !newBlock || oldBlock.type !== newBlock.type
+-      })
++      // PATCH (skillnet): if the blockUpdate event never arrives, the
++      // placement may have (a) actually succeeded but the event got routed
++      // elsewhere, or (b) been silently rejected by the server. Re-probe
++      // on timeout and only throw if the block is still not placed; when
++      // throwing, include a structured diagnostic so the LLM can diagnose.
++      try {
++        [oldBlock, newBlock] = await onceWithCleanup(bot, `blockUpdate:${dest}`, {
++          timeout: 5000,
++          // Condition to wait to receive block update actually changing the block type, in case the bot receives block updates with no changes
++          // oldBlock and newBlock will both be null when the world unloads
++          checkCondition: (oldBlock, newBlock) => !oldBlock || !newBlock || oldBlock.type !== newBlock.type
++        })
++      } catch (err) {
++        if (err && /did not fire within timeout/.test(err.message)) {
++          const probe = bot.blockAt(dest)
++          if (probe && oldBlock && probe.type !== oldBlock.type) {
++            // Placement actually succeeded — event just didn't fire.
++            newBlock = probe
++            bot.emit('blockPlaced', oldBlock, newBlock)
++            return
++          }
++          const diag = _diagnosePlaceFailure(bot, referenceBlock, faceVector, dest)
++          throw new Error(`placeBlock timeout (blockUpdate not fired within 5s): ${diag}`)
++        }
++        throw err
++      }
+     }
+ 
+     // blockUpdate emits (null, null) when the world unloads

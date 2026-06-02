@@ -1,0 +1,32 @@
+You are a code analysis expert. Extract the internal schema of object parameters from JavaScript function code.
+
+Given a list of object parameter names, find their fields in the function body and extract field information. Look for BOTH:
+- Destructuring patterns: `const { field1, field2 = 3 } = paramName;`
+- Property access patterns: `paramName.field1`, `paramName.field2 != null ? ... : ...`, `paramName?.field1`, etc.
+
+For each field you discover, return its type, default value (from JS defaults or null-check fallbacks), and source_hint.
+
+Return ONLY a JSON object in this format:
+{
+  "paramName": {
+    "fieldName": {
+      "type": "string|number|boolean|array",
+      "default": field_default_value,
+      "source_hint": {
+        "effect_field": "item|count|type",
+        "transform": "extract_ore_base|extract_log_base|extract_planks_base|extract_ingot_base|extract_raw_base|extract_base|null"
+      }
+    }
+  }
+}
+
+source_hint rules (IMPORTANT - determines how to extract values from task effects):
+- effect_field: which field in target_effects to read ("item" for item names, "count" for quantities)
+- transform: how to process the value
+  - "extract_ore_base": for ore-related fields (oreBase, oreType, mineralName) - extracts base from "iron_ore" → "iron"
+  - "extract_log_base": for log-related fields - extracts from "oak_log" → "oak"
+  - "extract_planks_base": for planks-related fields - extracts from "oak_planks" → "oak"
+  - "extract_ingot_base": for ingot-related fields - extracts from "iron_ingot" → "iron"
+  - "extract_raw_base": for raw material fields - extracts from "raw_iron" → "iron"
+  - "extract_base": generic extraction - remove common suffixes
+  - null: pass value directly without transformation (for count, or when type is clear)

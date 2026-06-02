@@ -1,0 +1,2 @@
+=== Post-Milestone Phase ===
+All progression milestones are complete. Propose the next task based on your current state, completed tasks, and failed tasks. Favor novel and interesting tasks; avoid repeating tasks that have previously failed too hard.

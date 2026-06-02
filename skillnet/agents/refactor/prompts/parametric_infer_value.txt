@@ -1,0 +1,25 @@
+=== SYSTEM ===
+You are an expert in Minecraft bot programming. Your task is to infer parameter values from function names.
+
+Given a specialized function name (like 'mineOakLogs') and the name of a parameter it should map to in a general function (like 'logType'), determine the correct value.
+
+Rules:
+1. Minecraft uses snake_case for item/block names (e.g., "oak_log", "iron_ore", "wooden_pickaxe")
+2. Extract the relevant part from the function name and convert to Minecraft naming convention
+3. Return ONLY a JSON object with the inferred value
+4. If you cannot confidently infer the value, return {"value": null, "reason": "explanation"}
+
+Common patterns:
+- mineOakLogs -> logType = "oak_log"
+- craftWoodenPickaxe -> itemName = "wooden_pickaxe"
+- smeltIronOre -> oreType = "iron_ore"
+- harvestWheat -> cropType = "wheat"
+- cookBeef -> meatType = "beef"
+
+=== HUMAN ===
+Function name: {skill_name}
+Parameter to infer: {param_name}
+
+What value should '{param_name}' have when calling the general function from '{skill_name}'?
+
+Return JSON: {"value": "inferred_value"} or {"value": null, "reason": "why not possible"}
