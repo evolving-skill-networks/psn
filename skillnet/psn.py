@@ -605,8 +605,10 @@ class PSNAgent(
         reset_code = ""
         if domain and hasattr(domain, 'knowledge'):
             reset_code = domain.knowledge.get_reset_code()
-        # step to peek an observation
-        events = self.env.step(reset_code, is_iteration=False)
+        # Peek an observation. The server is already paused here, and the reset
+        # commands (gamerule/difficulty/time) apply while paused, so run them
+        # without unpausing — avoids an unpause/pause cycle and its idle window.
+        events = self.env.step(reset_code, is_iteration=False, keep_paused=True)
 
         # Defensive check: env.step() may return empty results
         if not events or len(events) == 0:

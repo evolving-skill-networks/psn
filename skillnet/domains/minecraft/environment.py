@@ -73,10 +73,11 @@ class MinecraftEnv(Environment):
         programs: str = "",
         skill_names: Optional[List[str]] = None,
         is_iteration: bool = True,
+        keep_paused: bool = False,
     ) -> Any:
         env = self._ensure_env()
         return env.step(code, programs=programs, skill_names=skill_names,
-                        is_iteration=is_iteration)
+                        is_iteration=is_iteration, keep_paused=keep_paused)
 
     def close(self) -> None:
         if self._env is not None:

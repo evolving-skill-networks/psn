@@ -928,18 +928,23 @@ app.post("/step", async (req, res) => {
     const code = req.body.code;
     const programs = req.body.programs;
     const skillNames = req.body.skill_names || []; // new: list of skill names
+    // keep_paused: world-setup commands run while the server is paused, so the
+    // tick-waits below MUST be skipped (waitForTicks would hang with no ticks).
+    const keepPaused = req.body.keep_paused === true;
     bot.cumulativeObs = [];
-    
+
     // Initialize skill-execution event storage
     bot.skillExecutions = [];
-    
+
     try {
-        console.log(`[Step] Starting step execution, waiting ${bot.waitTicks} ticks...`);
-        try {
-            await bot.waitForTicks(bot.waitTicks);
-            console.log(`[Step] Ticks waited, evaluating code...`);
-        } catch (err) {
-            console.log(`[Step] Warning: waitForTicks failed: ${err.message}, continuing anyway...`);
+        if (!keepPaused) {
+            console.log(`[Step] Starting step execution, waiting ${bot.waitTicks} ticks...`);
+            try {
+                await bot.waitForTicks(bot.waitTicks);
+                console.log(`[Step] Ticks waited, evaluating code...`);
+            } catch (err) {
+                console.log(`[Step] Warning: waitForTicks failed: ${err.message}, continuing anyway...`);
+            }
         }
         const r = await evaluateCode(code, programs, skillNames, mcData, Vec3);
         console.log(`[Step] Code evaluation result: ${r}`);
@@ -962,14 +967,16 @@ app.post("/step", async (req, res) => {
         // error is surfaced through the normal path. In-skill waits
         // are left native/uncapped, so legitimate long waits (smelting) work.
         const STEP_SETTLE_MS = parseInt(process.env.PSN_STEP_SETTLE_MS, 10) || 5000;
-        try {
-            await Promise.race([
-                bot.waitForTicks(bot.waitTicks),
-                new Promise((resolve) => setTimeout(resolve, STEP_SETTLE_MS)),
-            ]);
-            console.log(`[Step] Final ticks waited (or settle timeout), preparing response...`);
-        } catch (err) {
-            console.log(`[Step] Warning: final waitForTicks failed: ${err.message}, continuing anyway...`);
+        if (!keepPaused) {
+            try {
+                await Promise.race([
+                    bot.waitForTicks(bot.waitTicks),
+                    new Promise((resolve) => setTimeout(resolve, STEP_SETTLE_MS)),
+                ]);
+                console.log(`[Step] Final ticks waited (or settle timeout), preparing response...`);
+            } catch (err) {
+                console.log(`[Step] Warning: final waitForTicks failed: ${err.message}, continuing anyway...`);
+            }
         }
         
         // Append skill-execution events to cumulativeObs
@@ -1838,10 +1845,11 @@ app.post("/stop", (req, res) => {
     });
 });
 
-// Counts physicsTick events over a fixed wait window. Read-only —
-// no chat, no state change. Used by bridge to probe whether MC is
-// actually ticking (i.e. unpaused) without sending a /pause toggle
-// that could re-pause an already-unpaused server.
+// Counts SERVER ticks over a fixed window via world age (advances only when
+// the server ticks; client-side physicsTick fires regardless of server pause).
+// Read-only — no chat, no state change. Used by bridge to probe whether MC is
+// actually ticking (i.e. unpaused) without sending a /pause toggle that could
+// re-pause an already-unpaused server.
 app.post("/observe_ticks", async (req, res) => {
     if (!bot) {
         res.status(400).json({ error: "Bot not spawned" });
@@ -1850,15 +1858,10 @@ app.post("/observe_ticks", async (req, res) => {
     const timeoutMs = (req.body && Number.isFinite(req.body.timeout_ms))
         ? Math.max(500, Math.min(15000, req.body.timeout_ms))
         : 3000;
-    let tickCount = 0;
-    const handler = () => { tickCount++; };
-    bot.on('physicsTick', handler);
-    try {
-        await new Promise((resolve) => setTimeout(resolve, timeoutMs));
-    } finally {
-        bot.removeListener('physicsTick', handler);
-    }
-    res.json({ ticks: tickCount });
+    const ageOf = () => (bot.time ? bot.time.age : 0);
+    const a0 = ageOf();
+    await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+    res.json({ ticks: ageOf() - a0 });
 });
 
 app.post("/pause", async (req, res) => {
@@ -1866,34 +1869,40 @@ app.post("/pause", async (req, res) => {
         res.status(400).json({ error: "Bot not spawned" });
         return;
     }
-    // expect_running=true: caller wants confirmation that MC is ticking
-    // after the toggle (i.e. server transitioned to unpaused). No ticks
-    // observed in the timeout window means the chat command never made
-    // it through to MC — surface as 503 so the caller can retry without
-    // sending another toggle (which would re-pause if the chat eventually
-    // did land).
+    // /pause is a toggle. Confirm the target state via world age, which advances
+    // only when the server ticks: unpause returns once age starts advancing,
+    // pause once it stops, instead of waiting the full timeout.
     const expectRunning = req.body && req.body.expect_running === true;
     const timeoutMs = (req.body && Number.isFinite(req.body.timeout_ms))
         ? Math.max(500, Math.min(15000, req.body.timeout_ms))
         : 5000;
+    const ageOf = () => (bot.time ? bot.time.age : 0);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    let tickCount = 0;
-    const tickHandler = () => { tickCount++; };
-    bot.on('physicsTick', tickHandler);
-    try {
-        bot.chat("/pause");
-        await new Promise((resolve) => setTimeout(resolve, timeoutMs));
-    } finally {
-        bot.removeListener('physicsTick', tickHandler);
+    const _pauseT0 = Date.now();
+    bot.chat("/pause");
+    let confirmed = false;
+    if (expectRunning) {
+        const base = ageOf();
+        while (Date.now() - _pauseT0 < timeoutMs) {
+            await sleep(25);
+            if (ageOf() > base) { confirmed = true; break; }
+        }
+    } else {
+        const STILL_MS = 250; // age unchanged this long => server frozen
+        let prev = ageOf(); let lastChange = Date.now();
+        while (Date.now() - _pauseT0 < timeoutMs) {
+            await sleep(25);
+            const a = ageOf();
+            if (a !== prev) { prev = a; lastChange = Date.now(); }
+            else if (Date.now() - lastChange >= STILL_MS) { confirmed = true; break; }
+        }
     }
-
-    if (expectRunning && tickCount < 2) {
-        return res.status(503).json({
-            error: "no ticks observed",
-            ticks: tickCount,
-        });
+    const elapsed = Date.now() - _pauseT0;
+    if (expectRunning && !confirmed) {
+        return res.status(503).json({ error: "server did not resume ticking", ms: elapsed });
     }
-    res.json({ message: "Success", ticks: tickCount });
+    res.json({ message: "Success", confirmed: confirmed, ms: elapsed });
 });
 
 // ============================================================

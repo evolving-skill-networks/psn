@@ -187,6 +187,7 @@ class SkillNetEnv(gym.Env):
         programs: str = "",
         skill_names: list = None,
         is_iteration: bool = True,
+        keep_paused: bool = False,
     ) -> Tuple[ObsType, SupportsFloat, bool, bool, Dict[str, Any]]:
         if not self.has_reset:
             raise RuntimeError("Environment has not been reset yet")
@@ -203,10 +204,14 @@ class SkillNetEnv(gym.Env):
                 print("\033[33m[Env Step] Process is running but HTTP server is unresponsive; retrying after a wait...\033[0m")
                 time.sleep(2)
         
-        self.unpause()
+        # keep_paused: world-setup commands apply while the server is paused, so
+        # the reset path runs them without unpausing (no idle window).
+        if not keep_paused:
+            self.unpause()
         data = {
             "code": code,
             "programs": programs,
+            "keep_paused": keep_paused,
         }
         # Opt-in: dump every /step request body to disk so a failing skill
         # can be replayed byte-identically against a debug mineflayer.
@@ -249,7 +254,8 @@ class SkillNetEnv(gym.Env):
                 if res.status_code != 200:
                     raise RuntimeError(f"Failed to step Minecraft server: status code {res.status_code}")
                 returned_data = res.json()
-                self.pause()
+                if not keep_paused:
+                    self.pause()
                 
                 # Emit iteration-counter log only for real iterations.
                 if is_iteration:
