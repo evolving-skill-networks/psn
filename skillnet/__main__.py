@@ -177,6 +177,9 @@ def parse_args():
                         help='Include full skill code in action agent prompt (default: signatures only)')
     parser.add_argument('--pure-reasoning', action='store_true',
                         help='Remove domain-specific data injection from optimization prompts (for evaluation)')
+    parser.add_argument('--combat', action='store_true',
+                        help='Combat mode (Minecraft): do not force peaceful/day on reset, so hostile '
+                             'mobs spawn and the manually-set difficulty/time persist')
 
     # LLM backend selection
     parser.add_argument('--model', choices=['openai', 'vllm'], default=None,
@@ -447,7 +450,8 @@ if __name__ == "__main__":
     from skillnet.domains import get_domain
     if args.domain == 'minecraft':
         domain = get_domain('minecraft',
-            mc_port=mc_port, model_name=action_agent_model, kr_llm=kr_llm)
+            mc_port=mc_port, model_name=action_agent_model, kr_llm=kr_llm,
+            combat=args.combat)
     else:
         if args.mc_port is not None:
             raise SystemExit(

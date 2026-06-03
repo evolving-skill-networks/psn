@@ -20,9 +20,12 @@ class MinecraftKnowledge(DomainKnowledge):
     and skillnet/agents/constants/.
     """
 
-    def __init__(self, model_name: str = "gpt-5-mini", kr_llm=None):
+    def __init__(self, model_name: str = "gpt-5-mini", kr_llm=None, combat: bool = False):
         self._model_name = model_name
         self._kr_llm = kr_llm
+        # Combat mode: don't force the world to peaceful/day on each reset, so
+        # hostile mobs spawn and the manually-set difficulty/time persist.
+        self._combat = combat
         self._register_knowledge_builder()
 
     def _register_knowledge_builder(self):
@@ -932,6 +935,11 @@ class MinecraftKnowledge(DomainKnowledge):
         }
 
     def get_reset_commands(self) -> List[str]:
+        # Default forces peaceful + day for clean skill learning. Combat mode
+        # keeps the manual difficulty/time and re-enables the day/night cycle so
+        # night falls and hostile mobs spawn.
+        if self._combat:
+            return ['/gamerule doDaylightCycle true']
         return ['/time set day', '/difficulty peaceful']
 
     def get_skill_verb_prefixes(self) -> List[str]:

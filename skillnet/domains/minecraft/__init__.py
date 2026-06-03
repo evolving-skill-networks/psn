@@ -31,6 +31,7 @@ def MinecraftDomain(
     curriculum_agent=None,
     critic_agent=None,
     kr_llm=None,
+    combat=False,
 ) -> DomainModule:
     """
     Factory function that creates a DomainModule for Minecraft.
@@ -60,6 +61,7 @@ def MinecraftDomain(
     knowledge = MinecraftKnowledge(
         model_name=model_name,
         kr_llm=kr_llm,
+        combat=combat,
     )
 
     curriculum = MinecraftCurriculum(agent=curriculum_agent)

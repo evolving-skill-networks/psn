@@ -50,6 +50,7 @@ show_usage() {
     echo "  --no-refactor    Disable skill refactoring"
     echo "  --include-skill-code  Include full skill code in action agent prompt (default: signatures only)"
     echo "  --pure-reasoning   Remove domain data injection from optimization (for evaluation)"
+    echo "  --combat         Minecraft: don't force peaceful/day on reset (mobs spawn; keep manual difficulty/time)"
     echo ""
     echo "LLM Backend:"
     echo "  --model=openai  Use OpenAI API (gpt-5-mini)"
@@ -256,6 +257,9 @@ run_app() {
     fi
     if [[ "$PURE_REASONING" == "true" ]]; then
         PYTHON_ARGS="$PYTHON_ARGS --pure-reasoning"
+    fi
+    if [[ "$COMBAT" == "true" ]]; then
+        PYTHON_ARGS="$PYTHON_ARGS --combat"
     fi
 
     # Run options
@@ -529,6 +533,7 @@ PLANNER_MODE=""
 NO_OPTIMIZER=""
 NO_REFACTOR=""
 INCLUDE_SKILL_CODE=""
+COMBAT=""
 CURRICULUM_AGENT_MODE="auto"
 RUN_MODE="learn"
 CKPT_DIR=""
@@ -555,6 +560,9 @@ for arg in "$@"; do
             ;;
         --pure-reasoning)
             PURE_REASONING="true"
+            ;;
+        --combat)
+            COMBAT="true"
             ;;
         # Experiment parameters
         --optimization-threshold=*)
