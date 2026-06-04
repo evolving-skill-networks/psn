@@ -123,12 +123,56 @@ async function placeItem(bot, name, position) {
     } catch (err) {
         const afterItem = bot.inventory.findInventoryItem(itemByName.id);
         if (afterItem?.count === item_count) {
-            // item still in inventory -> placement really failed
+            // item still in inventory -> placement really failed. The server
+            // silently rejects placing a block into a cell an entity stands in
+            // (no blockUpdate fires), so the raw error reads as an empty-air
+            // timeout. Surface the blocking entity so the caller can perceive
+            // and decide how to handle it (kill it, lure it away, place elsewhere).
+            const blocker = entityOccupyingCell(bot, position);
+            const blockedNote = blocker
+                ? ` A ${entityLabel(blocker)} is occupying the target cell ${position}; a block cannot be placed where an entity stands.`
+                : "";
             bot.chat(`Error placing ${name}: ${err.message}, please find another position to place`);
-            throw new Error(`Failed to place ${name}: ${err.message}`);
+            throw new Error(`Failed to place ${name}: ${err.message}.${blockedNote}`);
         } else {
             // item count decreased -> placement actually succeeded (mineflayer API false negative)
             bot.chat(`Placed ${name}`);
         }
     }
+}
+
+// A block cannot be placed where an entity stands. Return the entity whose body
+// overlaps `cell` (a floored Vec3), or null. Mob/player bodies are ~0.6 wide and
+// up to ~2 tall, so test the entity's horizontal centre against the cell expanded
+// by a half-width and its vertical span against the cell's [y, y+1). Dropped
+// items, xp orbs and projectiles do not block placement and are ignored.
+function entityOccupyingCell(bot, cell) {
+    const HALF_W = 0.4;
+    const SKIP = new Set(["object", "orb", "projectile", "global", "other"]);
+    let best = null;
+    let bestDist = Infinity;
+    for (const id in bot.entities) {
+        const e = bot.entities[id];
+        if (!e || e === bot.entity || !e.position) continue;
+        if (e.type && SKIP.has(e.type)) continue;
+        if (e.name === "item" || e.name === "experience_orb" || e.name === "arrow") continue;
+        const ep = e.position;
+        const height = e.height && e.height > 0 ? e.height : 1.8;
+        const horizIn =
+            ep.x >= cell.x - HALF_W && ep.x <= cell.x + 1 + HALF_W &&
+            ep.z >= cell.z - HALF_W && ep.z <= cell.z + 1 + HALF_W;
+        const vertIn = ep.y <= cell.y + 1 && ep.y + height >= cell.y;
+        if (horizIn && vertIn) {
+            const d = ep.distanceTo(cell.offset(0.5, 0.5, 0.5));
+            if (d < bestDist) {
+                bestDist = d;
+                best = e;
+            }
+        }
+    }
+    return best;
+}
+
+function entityLabel(e) {
+    return e.username || e.name || e.displayName || e.kind || "entity";
 }

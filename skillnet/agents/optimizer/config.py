@@ -14,6 +14,11 @@ class BloatPreventionConfig:
 
     Controls code growth and prevents unbounded skill-code bloat.
     """
+    # Master switch. Off by default: line-count/growth limits can reject an
+    # otherwise-correct fix (e.g. a skill that must add entity-handling logic),
+    # so bloat checking is opt-in rather than blocking optimization out of the box.
+    ENABLED: bool = False
+
     # Growth-ratio limits
     GROWTH_HARD_LIMIT_RATIO: float = 3.0   # Hard limit: reject growth above 300%
     GROWTH_SOFT_LIMIT_RATIO: float = 2.0   # Soft limit: growth above 200% triggers a warning

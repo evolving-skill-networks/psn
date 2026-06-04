@@ -72,7 +72,7 @@ class PromptBuildingMixin:
 
         # Combine messages
         messages = [
-            SystemMessage(content=self.psn_system_prompt),
+            SystemMessage(content=self._system_prompt_for_phase()),
             self._render_human_message_with_psn(observation, psn_context)
         ]
 
@@ -335,6 +335,41 @@ class PromptBuildingMixin:
         content += "\nRespond with: Reasoning: <your reasoning>\nTask: <the task>"
 
         return HumanMessage(content=content)
+
+    def _system_prompt_for_phase(self) -> str:
+        """System prompt, with the milestone-priority section neutralized once
+        all milestones are complete.
+
+        The static CORE PRINCIPLES section ranks milestone/progression tasks
+        first and explicitly deprioritizes "food/hunting". Those rules are
+        conditioned on milestones being incomplete, but the text stays in the
+        prompt after the tech tree is done and keeps biasing the LLM away from
+        combat/exploration. Post-milestone we swap it for a neutral section so
+        every task type is treated equally.
+        """
+        prompt = self.psn_system_prompt
+        try:
+            post_milestone = self.goal_planner.get_next_milestone() is None
+        except Exception:
+            post_milestone = False
+        if not post_milestone or not prompt:
+            return prompt
+
+        neutral = (
+            "=== CORE PRINCIPLES (POST-MILESTONE / OPEN EXPLORATION) ===\n\n"
+            "All progression milestones are complete. There is NO milestone\n"
+            "priority and no progression bias any more. Treat every task type as\n"
+            "equally valid: Mine, Craft, Smelt, Cook, Place, Equip, and Kill\n"
+            "(combat). Choose the most novel and interesting task for the agent's\n"
+            "current state; do not repeat tasks that have already failed hard.\n"
+            "Only propose a task achievable right now, with a specific item and\n"
+            "quantity so success is verifiable from inventory.\n"
+        )
+        import re
+        pattern = re.compile(r"=== CORE PRINCIPLES ===.*?(?=\n=== TASK FORMAT ===)", re.DOTALL)
+        if pattern.search(prompt):
+            return pattern.sub(neutral, prompt)
+        return prompt
 
     def _generate_learning_context(self, task: str, learning_path: LearningPath) -> str:
         """

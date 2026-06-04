@@ -160,6 +160,19 @@ class BloatChecker:
         skill_type = self._determine_skill_type(old_code, old_lines)
         max_allowed = self._get_max_allowed_lines(old_lines, skill_type)
 
+        # Master switch (default off): when disabled, never block on size, so an
+        # oversized but correct optimization is passed through and kept.
+        if not getattr(self.config, "ENABLED", False):
+            return BloatCheckResult(
+                passed=True,
+                skill_type=skill_type,
+                old_lines=old_lines,
+                new_lines=new_lines,
+                max_allowed_lines=max_allowed,
+                growth_ratio=growth_ratio,
+                message="Bloat checking disabled",
+            )
+
         issues = []
 
         # Log growth information
