@@ -213,6 +213,31 @@ class EffectVerificationMixin:
                 # This is intentional: block effects need more sophisticated verification logic
                 effect_details.append(f"block:{block_item}:{block_operation} (LLM verified)")
 
+            elif effect_type == "dimension":
+                # Dimension-entry effect: achieved when the post-execution
+                # dimension matches the declared target. Only rule-checkable
+                # when the dimension was actually observed; on payloads
+                # recorded without it, skip counting so legacy behavior
+                # (no verifiable effects) is preserved.
+                post_dim = post_state.get("dimension") if post_state else None
+                if not post_dim:
+                    effect_details.append("dimension: unverifiable (no dimension observation)")
+                    continue
+                effects_checked += 1
+                if is_primary:
+                    primary_checked += 1
+                target_dim = str(state_repr.get("dimension", "") or state_repr.get("item", ""))
+                normalized_target = target_dim.lower().replace("minecraft:", "")
+                if normalized_target and normalized_target in str(post_dim).lower():
+                    effects_achieved += 1
+                    effect_details.append(f"entered {post_dim}")
+                    if is_primary:
+                        primary_achieved += 1
+                else:
+                    effect_details.append(
+                        f"dimension:{target_dim} not reached (current: {post_dim})"
+                    )
+
             elif effect_type == "nearby_block":
                 # find-type effect verification: check whether the target block exists in post_state
                 effects_checked += 1

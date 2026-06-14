@@ -126,6 +126,18 @@ Return ONLY a JSON object in this format:
   ]
 }"""
 
+# Shared tail for both extraction prompts: dimension transitions are runtime
+# verifiable (status.js emits the dimension), so they are a legal effect type.
+_DIMENSION_PROMPT_EXTENSION = """
+
+DIMENSION-CHANGE TASKS: if the task or code requires ENTERING another dimension (e.g. "enter the nether", walking through a nether portal or end portal), express that final goal as:
+{"type": "dimension", "dimension": "the_nether", "count": 1, "operation": "enter"}
+(use "the_end" for end portals, "overworld" for returning). Building or lighting a portal is still a "place"/"inventory" effect; only the actual dimension transition uses "dimension"."""
+
+INTENT_EXTRACTION_SYSTEM_PROMPT += _DIMENSION_PROMPT_EXTENSION
+CODE_EXTRACTION_SYSTEM_PROMPT += _DIMENSION_PROMPT_EXTENSION
+
+
 MERGE_SYSTEM_PROMPT = """You are an expert at analyzing and merging Minecraft skill effects.
 
 Your task is to merge effects from two sources (intent-based and code-based) by:

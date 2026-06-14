@@ -32,6 +32,10 @@ class Status extends Observation {
             timeOfDay: this.getTime(),
             inventoryUsed: this.bot.inventoryUsed(),
             elapsedTime: this.bot.globalTickCounter,
+            // Dimension is decisive evidence for dimension-entry tasks
+            // (e.g. "enter a nether portal"): without it the critic can only
+            // infer entry from skill names, which produced false positives.
+            dimension: this.bot.game ? this.bot.game.dimension : undefined,
         };
     }
 

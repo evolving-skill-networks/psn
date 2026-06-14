@@ -84,6 +84,9 @@ def parse_skill_events(
                         "equipment": state_data.get("equipment", {}),
                         "nearby_blocks": nearby_blocks,
                     }
+                    # Present only when the runtime emitted it
+                    if state_data.get("dimension"):
+                        pre_state["dimension"] = state_data["dimension"]
                 skill_executions[skill_name] = {
                     "start_time": event_data.get("timestamp"),
                     "call_stack": event_data.get("callStack", []),
@@ -107,6 +110,9 @@ def parse_skill_events(
                         "equipment": state_data.get("equipment", {}),
                         "nearby_blocks": nearby_blocks,
                     }
+                    # Present only when the runtime emitted it
+                    if state_data.get("dimension"):
+                        post_state["dimension"] = state_data["dimension"]
                 skill_executions[skill_name].update({
                     "end_time": event_data.get("timestamp"),
                     "duration": event_data.get("duration", 0),
@@ -130,6 +136,9 @@ def parse_skill_events(
                         "equipment": state_data.get("equipment", {}),
                         "nearby_blocks": nearby_blocks,
                     }
+                    # Present only when the runtime emitted it
+                    if state_data.get("dimension"):
+                        post_state["dimension"] = state_data["dimension"]
                 skill_executions[skill_name].update({
                     "end_time": event_data.get("timestamp"),
                     "duration": event_data.get("duration", 0),

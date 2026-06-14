@@ -31,11 +31,21 @@ async function killMob(bot, mobName, timeout = 300) {
             entity.position.distanceTo(bot.entity.position) < 48
     );
     if (!entity) {
-        bot.chat(`No ${mobName} nearby, please explore first`);
+        // Be specific about what was searched: the radius, the bot position,
+        // and whether the mob exists just beyond range (approach vs explore).
+        const p = bot.entity.position;
+        const here = `within 48 blocks of (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)})`;
+        const beyond = bot.nearestEntity(
+            (e) => e.name === mobName && e.position && bot.entity
+        );
+        const hint = beyond && beyond.position
+            ? `; the nearest ${mobName} is ${beyond.position.distanceTo(p).toFixed(0)} blocks away, approach it first`
+            : `, please explore first`;
+        bot.chat(`No ${mobName} ${here}${hint}`);
         _killMobFailCount++;
         if (_killMobFailCount > 10) {
             throw new Error(
-                `killMob failed too many times, make sure you explore before calling killMob`
+                `killMob failed too many times: no ${mobName} ${here}${hint}.`
             );
         }
         return;

@@ -388,7 +388,7 @@ class TwoPhaseOptimizationEngine:
                     skill_name=skill_name,
                     current_task=task,
                     current_context=context,
-                    current_state=None,
+                    current_state=getattr(self, "_current_state", None),  # World snapshot at failure
                     current_error=error,
                     current_critique=critique,
                     skill_delta=delta,  # pass the original SkillDelta to preserve structured Gradient info
@@ -525,6 +525,7 @@ class TwoPhaseOptimizationEngine:
                     quality_metrics=quality_metrics,
                     chat_log=chat_log,
                     skill_execution_results=skill_execution_results,
+                    current_state=current_state,
                 )
             except Exception as e:
                 self._log(f"[TwoPhaseEngine] Pure Pipeline execution failed: {e}", "error")
@@ -549,6 +550,7 @@ class TwoPhaseOptimizationEngine:
         quality_metrics: Optional[Dict[str, Any]] = None,
         chat_log: str = "",  # Chat log from onChat events
         skill_execution_results: Optional[Dict[str, Dict[str, Any]]] = None,
+        current_state: Optional[Dict[str, Any]] = None,  # World snapshot at failure
     ) -> TwoPhaseOptimizationResult:
         """
         Execute optimization via the pure pipeline
@@ -561,6 +563,8 @@ class TwoPhaseOptimizationEngine:
             start_time: start time
             quality_metrics: v7.5.4 Critic quality metrics
             chat_log: v7.7 Chat log containing diagnostic messages
+            current_state: world snapshot at the failure observation (nearby
+                entities, spatial cell dump); rendered into the Phase-1 prompt
 
         Returns:
             TwoPhaseOptimizationResult: optimization result
@@ -571,6 +575,8 @@ class TwoPhaseOptimizationEngine:
         self._current_quality_metrics = quality_metrics
         # store chat_log for use by _pure_pipeline_optimize_fn
         self._current_chat_log = chat_log
+        # store the world snapshot for _pure_pipeline_optimize_fn (Phase 2)
+        self._current_state = current_state
 
         result = TwoPhaseOptimizationResult(
             success=False,
@@ -620,6 +626,7 @@ class TwoPhaseOptimizationEngine:
                 root_feedback_type=feedback_type,
                 skill_info_getter=self.skill_info_getter,
                 chat_log=chat_log,  # Pass chat log to pipeline
+                current_state=current_state,  # World snapshot at failure
             )
             # 5C: Store execution result for operational statistics extraction
             self._last_execution_result = execution_result
@@ -776,8 +783,9 @@ class TwoPhaseOptimizationEngine:
                 except Exception as txn_error:
                     self._log(f"[PurePipeline] Transaction rollback failed: {txn_error}", "error")
 
-            # clear quality_metrics
+            # clear quality_metrics and the world snapshot
             self._current_quality_metrics = None
+            self._current_state = None
             raise  # re-raise the exception for upper layers to handle
 
         result.completed_at = datetime.now().isoformat()
@@ -815,8 +823,9 @@ class TwoPhaseOptimizationEngine:
         except Exception:
             pass
 
-        # clear quality_metrics
+        # clear quality_metrics and the world snapshot
         self._current_quality_metrics = None
+        self._current_state = None
 
         return result
 

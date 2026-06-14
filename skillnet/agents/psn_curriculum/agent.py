@@ -103,6 +103,8 @@ class PSNCurriculumAgent(
         qa_openai_api_key=None,
         # Failure threshold tuning
         milestone_task_failure_threshold: int = 5,
+        # Post-milestone exploration: continue/decompose learning paths or not
+        enable_postmilestone_adaptive: bool = False,
     ):
         """
         Initialize PSNCurriculumAgent.
@@ -180,6 +182,10 @@ class PSNCurriculumAgent(
 
         # Configuration for adaptive learning
         self.enable_adaptive_learning = True  # Can be disabled via config
+        # Post-milestone: continue/decompose learning paths during open
+        # exploration. Off (default) => one fresh LLM-proposed task per
+        # iteration (no path continuation preempting novel proposals).
+        self.enable_postmilestone_adaptive = enable_postmilestone_adaptive
 
         # Milestone failure threshold (configurable to support weaker models)
         self.milestone_task_failure_threshold = milestone_task_failure_threshold
@@ -528,12 +534,16 @@ class PSNCurriculumAgent(
             )
 
             # ===== Decomposition check for exploration tasks =====
-            result = self._try_continue_learning_path(inventory=inventory)
-            if result:
-                return result
-            result = self._try_decompose_task(task_str, inventory, "Exploration task")
-            if result:
-                return result
+            # Skipped when post-milestone adaptive paths are disabled: continuing
+            # a stuck learning path preempts the fresh proposal above and starves
+            # novel exploration, so run the LLM-proposed task directly instead.
+            if self.enable_postmilestone_adaptive:
+                result = self._try_continue_learning_path(inventory=inventory)
+                if result:
+                    return result
+                result = self._try_decompose_task(task_str, inventory, "Exploration task")
+                if result:
+                    return result
 
             return self._create_task_with_semantic(task_str), context
 

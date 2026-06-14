@@ -436,10 +436,20 @@ class PrimitiveKnowledgeBase:
 
         # NOTE: removed the fix_strategies section to let the LLM reason on its own
 
-        # Related skills
-        if analysis["related_skills"]:
-            lines.append(f"### Related Skills to Consider:\n")
-            lines.append(f"Consider using these existing skills: {', '.join(analysis['related_skills'])}\n")
+        # NOTE: intentionally NO "Related Skills to Consider" section here.
+        # It used to render analysis["related_skills"], which is a static,
+        # hard-coded wishlist of aspirational skill names (e.g.
+        # ensureCraftingTable / ensureItem / gatherMaterials) that are not
+        # guaranteed to exist in the graph. Naming a non-existent skill drove
+        # the optimizer to inline it (-> Responsibility Check reject) or call a
+        # phantom (-> Reference Check reject), a deadlock that burned craftAxe's
+        # optimization rounds in the qwen3-coder-next e2e run (round 0 generated
+        # `async function ensureCraftingTable` inline). The real, graph-derived
+        # skill list is injected separately by Phase 1 as the "Available learned
+        # skills" composable section (pure_reflection.py), which only lists
+        # skills that actually exist. Keep the factual primitive/precondition
+        # knowledge above; let that composable section be the single source of
+        # callable skill names.
 
         return "\n".join(lines)
 
@@ -746,7 +756,7 @@ class RecipeDependencyAnalyzer:
         # Look up the recipe
         recipe = self.get_recipe(item)
         if not recipe:
-            # No recipe — this is a raw material
+            # No recipe: this is a raw material
             result.total_raw_materials[item] = (
                 result.total_raw_materials.get(item, 0) + need_to_craft
             )

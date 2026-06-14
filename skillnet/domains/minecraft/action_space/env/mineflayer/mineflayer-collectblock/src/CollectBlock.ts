@@ -21,6 +21,8 @@ async function collectAll (
 ): Promise<void> {
   let success_count = 0
   while (!options.targets.empty) {
+    // PATCH (skillnet): cooperative cancellation point (see Targets.cancelled).
+    if (options.targets.cancelled) break
     await emptyInventoryIfFull(
       bot,
       options.chestLocations,
@@ -38,6 +40,11 @@ async function collectAll (
             closest as Block,
             equipToolOptions
           )
+          // PATCH (skillnet): a cancel can land while equipForBlock is awaited;
+          // the goto below would then call setGoal, which DISCARDS the pending
+          // pathfinder stop (stopPathing = false), resurrecting the task for a
+          // whole extra target leg. Re-check before re-arming the pathfinder.
+          if (options.targets.cancelled) break
           const goal = new goals.GoalLookAtBlock(
             closest.position,
             bot.world
@@ -47,6 +54,17 @@ async function collectAll (
           success_count++
           // TODO: options.ignoreNoPath
         } catch (err) {
+          // PATCH (skillnet): when the task was cancelled, a PathStopped /
+          // GoalChanged rejection is the cancellation itself: propagate it out
+          // of the loop instead of skip-one-continue, and do it BEFORE the
+          // setGoal(null) below so a dying task never clobbers a goal the new
+          // owner may already have set. Gated on cancelled so a mid-collect
+          // path stop from elsewhere (e.g. the wedge-escape cap) keeps today's
+          // per-target recovery.
+          if (options.targets.cancelled &&
+              ((err as any).name === 'PathStopped' || (err as any).name === 'GoalChanged')) {
+            throw err
+          }
           // console.log(err.stack)
           // bot.pathfinder.stop()
           // bot.waitForTicks(10)
@@ -167,10 +185,26 @@ async function collectAll (
               )
             }
           )
-          bot.pathfinder.setGoal(
-            new goals.GoalFollow(closest as Entity, 0)
-          )
-          await waitForPickup
+          // PATCH (skillnet): dynamic=true. A static GoalFollow terminates on
+          // arrival (goal_reached -> fullStop), so once the bot reaches the
+          // drop's block it stops; in flowing water the drop keeps drifting and
+          // the bot then idles until the 10s timeout, losing it. Dynamic keeps
+          // the follow live so the bot chases the drifting drop until pickup.
+          const followGoal = new goals.GoalFollow(closest as Entity, 0)
+          bot.pathfinder.setGoal(followGoal, true)
+          try {
+            await waitForPickup
+          } finally {
+            // PATCH (skillnet): the executor never clears a dynamic goal (both
+            // goal_reached clears are gated on !dynamicGoal) and the success
+            // path never called setGoal(null), so the dead drop's GoalFollow
+            // leaked out of collect() and later actions dragged the bot back
+            // to the drop's last cell. Clear it iff it is still ours; the
+            // identity guard spares a goal a canceller or new owner installed.
+            if (bot.pathfinder.goal === followGoal) {
+              try { bot.pathfinder.setGoal(null) } catch (e) {}
+            }
+          }
         } catch (err) {
           // @ts-expect-error
           console.log(err.stack)
@@ -251,6 +285,39 @@ async function mineBlock (
       options.targets.appendTarget(entity)
     }
   })
+  // PATCH (skillnet): station-keeping for the dig + item-settle window.
+  // collectblock has no motor control here (the approach goto already resolved
+  // and set no goal), so during a multi-second dig flowing water washes the bot
+  // out of interaction range; the block's drop then spawns far / drifts and
+  // vanilla proximity pickup never fires. Hold the bot at the anchor (the
+  // in-reach spot the approach left it) for the whole window so the block stays
+  // reachable and the fresh drop is auto-collected on spawn. Engages only when
+  // actually drifting (in water or measurably displaced) so dry-land behaviour
+  // is byte-identical; yaw-only steer leaves the dig's pitch aim untouched.
+  const anchor = bot.entity.position.clone()
+  const stationKeep = (): void => {
+    if (bot.entity == null) return
+    const p = bot.entity.position
+    const dx = anchor.x - p.x
+    const dz = anchor.z - p.z
+    const distSq = dx * dx + dz * dz
+    const inWater = (bot.entity as any).isInWater === true // runtime flag, not in the Entity type
+    if (!inWater && distSq <= 0.04) return // dry land, in place: do nothing
+    if (distSq <= 0.04) {
+      bot.setControlState('forward', false)
+      bot.setControlState('jump', false)
+      bot.setControlState('sneak', false)
+      return
+    }
+    bot.look(Math.atan2(-dx, -dz), bot.entity.pitch, true)
+    bot.setControlState('forward', true)
+    if (inWater) {
+      // directional swim: rise toward the anchor when below it, sink when above
+      bot.setControlState('jump', anchor.y > p.y + 0.25)
+      bot.setControlState('sneak', anchor.y < p.y - 1)
+    }
+  }
+  bot.on('physicsTick', stationKeep)
   try {
     // @ts-expect-error
     await bot.dig(block)
@@ -266,6 +333,10 @@ async function mineBlock (
       })
     })
   } finally {
+    bot.removeListener('physicsTick', stationKeep)
+    bot.setControlState('forward', false)
+    bot.setControlState('jump', false)
+    bot.setControlState('sneak', false)
     tempEvents.cleanup()
   }
 }
@@ -433,7 +504,13 @@ export class CollectBlock {
       this.bot.pathfinder.setMovements(this.movements)
     }
 
-    if (!optionsFull.append) await this.cancelTask()
+    if (!optionsFull.append) {
+      await this.cancelTask()
+      // PATCH (skillnet): a fresh (non-append) task starts un-cancelled. The
+      // reset stays inside the !append branch: an append joins a possibly
+      // cancelling task and must not resurrect it.
+      this.targets.cancelled = false
+    }
     if (Array.isArray(target)) {
       this.targets.appendTargets(target)
     } else {
@@ -446,8 +523,11 @@ export class CollectBlock {
     } catch (err) {
       this.targets.clear()
       // Ignore path stopped error for cancelTask to work properly (imo we shouldn't throw any pathing errors)
+      // PATCH (skillnet): GoalChanged is the other cancellation-shaped
+      // rejection (the canceller cleared or replaced the goal); swallow it the
+      // same way so a cancelled collect resolves instead of rejecting.
       // @ts-expect-error
-      if (err.name !== 'PathStopped') throw err
+      if (err.name !== 'PathStopped' && err.name !== 'GoalChanged') throw err
     } finally {
       // @ts-expect-error
       this.bot.emit('collectBlock_finished')
@@ -490,6 +570,10 @@ export class CollectBlock {
       if (cb != null) cb()
       return await Promise.resolve()
     }
+    // PATCH (skillnet): make cancellation cooperative, not just a path stop.
+    // With ignoreNoPath the loop used to swallow the PathStopped and walk the
+    // remaining target list to exhaustion before 'collectBlock_finished'.
+    this.targets.cancelled = true
     this.bot.pathfinder.stop()
     if (cb != null) {
       // @ts-expect-error

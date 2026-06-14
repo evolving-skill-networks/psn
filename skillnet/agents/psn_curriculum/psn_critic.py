@@ -59,6 +59,18 @@ class PSNCriticAgent(CriticAgent):
                 "- NEVER infer or assume inventory changes that are not explicitly listed "
                 "in the State Changes field. Only use the data provided.\n"
             )
+            enhanced_rules += (
+                "- Executed Skills lists skill NAMES only. A skill's name is "
+                "NOT evidence that its effect occurred; judge ONLY from the "
+                "observed evidence (State Changes, Nearby Blocks Changes, "
+                "Placed blocks, Dimension fields).\n"
+                "- For tasks that require entering another dimension (e.g. "
+                "entering a nether portal), success REQUIRES a Dimension "
+                "Change line showing the new dimension. A 'Dimension "
+                "(unchanged during this task)' line or missing dimension "
+                "evidence means the bot did NOT enter, regardless of which "
+                "skills executed.\n"
+            )
             base_prompt += enhanced_rules
 
         return SystemMessage(content=base_prompt)

@@ -26,6 +26,65 @@ if TYPE_CHECKING:
 class OptimizationLifecycleMixin:
     """Optimization lifecycle callbacks and two-phase orchestration."""
 
+    def _build_responsibility_rejection_feedback(self, skill_name: str) -> str:
+        """Build the retry feedback shown after a Responsibility-Check rejection.
+
+        Returns "" when the skill has no recorded responsibility rejections.
+        """
+        resp_rejections = self._responsibility_check_rejections.get(skill_name, [])
+        if not resp_rejections:
+            return ""
+        resp_warning = "\n## PREVIOUS OPTIMIZATION REJECTED BY RESPONSIBILITY CHECK\n"
+        resp_warning += (
+            "Your previous optimization(s) were REJECTED because the code inlined "
+            "logic that belongs to a DIFFERENT skill's responsibility (e.g. placement "
+            "logic in a crafting-focused skill). DO NOT repeat the same inlining "
+            "pattern; instead CALL the suggested composable skill.\n\n"
+        )
+        for i, rej in enumerate(resp_rejections[-3:], 1):  # last 3
+            resp_warning += f"Rejection {i}:\n"
+            resp_warning += f"  - reason: {rej['reason'][:300]}\n"
+            if rej.get("violated_helpers"):
+                resp_warning += (
+                    f"  - violated inline helpers: {rej['violated_helpers']}\n"
+                )
+            if rej.get("suggested_target_skill"):
+                resp_warning += (
+                    f"  - closest existing skill: "
+                    f"`await {rej['suggested_target_skill']}(bot)` "
+                    f"(verify it fits before calling)\n"
+                )
+        # Always show the REAL skill menu, not just a single best-effort guess.
+        # The rejection reason frequently names only the inlined helper (a name
+        # that does NOT exist as a skill, e.g. ensureCraftingTable) and generic
+        # "placeXXX/craftXXX" prose, so _extract_suggested_skill returns None
+        # and the LLM was left with no concrete redirect target -> it re-inlined
+        # the same helper next round (the craftAxe deadlock in the qwen run).
+        # Listing the actually-registered skills (mirrors the Reference-Check
+        # retry feedback) gives the LLM a real menu to choose from.
+        try:
+            all_names = sorted(
+                n for n in self.skill_graph_manager.get_all_skill_names()
+                if n and n != skill_name
+            )
+        except Exception:
+            all_names = []
+        if all_names:
+            shown = all_names[:30]
+            more = "" if len(all_names) <= 30 else f" (+{len(all_names) - 30} more)"
+            resp_warning += (
+                f"\nYou may ONLY redirect to one of these EXISTING skills "
+                f"({len(all_names)}{more}); CALL it, do NOT inline its logic:\n"
+                f"  {', '.join(shown)}\n"
+            )
+        resp_warning += (
+            "\nTo converge: pick the skill from the list above that matches the "
+            "rejected logic's purpose and CALL it with `await skillName(bot, ...)`. "
+            "If none fits, keep the logic minimal and inline only what is unique "
+            "to this skill; do NOT define a new standalone helper.\n"
+        )
+        return resp_warning
+
     def _optimizer_callback_wrapper(
         self,
         skill_name: str,
@@ -108,36 +167,12 @@ Fix: {suggested_fix}
                 ref_warning += "\nDo NOT invent new function names. Use ONLY existing skills listed below.\n"
                 enhanced_critique = ref_warning + "\n" + enhanced_critique
 
-            # Inject Responsibility Check rejection history
-            # When RespCheck rejects because inlined logic belongs to a sibling skill,
-            # surfacing the rejection reason + suggested composable alternative lets the
-            # next optimization round switch strategy instead of repeating the same
+            # Inject Responsibility Check rejection history. Surfacing the
+            # rejection reason + the real skill menu lets the next round switch
+            # strategy (call a composable skill) instead of repeating the same
             # inline pattern (which led to the r2 infinite loop).
-            resp_rejections = self._responsibility_check_rejections.get(skill_name, [])
-            if resp_rejections:
-                resp_warning = "\n## PREVIOUS OPTIMIZATION REJECTED BY RESPONSIBILITY CHECK\n"
-                resp_warning += (
-                    "Your previous optimization(s) were REJECTED because the code inlined "
-                    "logic that belongs to a DIFFERENT skill's responsibility (e.g. placement "
-                    "logic in a crafting-focused skill). DO NOT repeat the same inlining "
-                    "pattern — instead CALL the suggested composable skill.\n\n"
-                )
-                for i, rej in enumerate(resp_rejections[-3:], 1):  # last 3
-                    resp_warning += f"Rejection {i}:\n"
-                    resp_warning += f"  - reason: {rej['reason'][:300]}\n"
-                    if rej.get("violated_helpers"):
-                        resp_warning += (
-                            f"  - violated inline helpers: {rej['violated_helpers']}\n"
-                        )
-                    if rej.get("suggested_target_skill"):
-                        resp_warning += (
-                            f"  - use this COMPOSABLE SKILL instead: "
-                            f"`await {rej['suggested_target_skill']}(bot)`\n"
-                        )
-                resp_warning += (
-                    "\nTo converge: find a skill in COMPOSABLE SKILLS that matches the "
-                    "rejected logic's purpose, and CALL it with `await skillName(bot, ...)`.\n"
-                )
+            resp_warning = self._build_responsibility_rejection_feedback(skill_name)
+            if resp_warning:
                 enhanced_critique = resp_warning + "\n" + enhanced_critique
 
             # Function reference validation with retry loop.
@@ -187,7 +222,7 @@ Fix: {suggested_fix}
                 if ref_result["valid"]:
                     break  # Validation passed
 
-                # Validation failed — log and retry if attempts remain
+                # Validation failed: log and retry if attempts remain
                 undefined = [f["name"] for f in ref_result["undefined_functions"]]
                 suggestions = ref_result.get("suggestions", {})
                 self.logger.warning(
@@ -247,7 +282,7 @@ Fix: {suggested_fix}
                     )
                     critique_for_attempt = rejection_feedback + "\n" + enhanced_critique
                 else:
-                    # All retries exhausted — mark as failed
+                    # All retries exhausted: mark as failed
                     self.logger.error(
                         f"\033[31m[OptimizerCallback] Function reference validation failed (after {max_ref_retries + 1} attempts): "
                         f"undefined={undefined}\033[0m"
@@ -286,7 +321,7 @@ Fix: {suggested_fix}
         fb: 'OptimizationForwardFeedback',
     ) -> None:
         """
-        Callback after a successful optimization — records to detailed_logs
+        Callback after a successful optimization, records to detailed_logs
 
         Args:
             skill_name: skill name
@@ -348,7 +383,7 @@ Fix: {suggested_fix}
         fb: 'OptimizationForwardFeedback',
     ) -> None:
         """
-        Callback after a failed optimization — records to detailed_logs
+        Callback after a failed optimization, records to detailed_logs
 
         Args:
             skill_name: skill name

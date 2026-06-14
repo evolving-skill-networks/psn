@@ -193,6 +193,7 @@ class ReflectionChain:
         root_feedback_type: str = "error",
         skill_info_getter=None,
         chat_log: str = "",  # Chat log from onChat events
+        current_state: Optional[Dict[str, Any]] = None,  # World snapshot at failure
     ) -> ReflectionChainResult:
         """
         Build the reflection chain.
@@ -207,6 +208,8 @@ class ReflectionChain:
                 signature: (skill_name: str) -> Dict[str, Any]
                 returns: {"code": str, "description": str, "children": List[str], ...}
             chat_log: v7.7 Chat log containing diagnostic messages
+            current_state: world snapshot at the failure observation
+                (nearby_entities, spatial cell dump, inventory, position)
 
         Returns:
             ReflectionChainResult: the constructed reflection chain
@@ -223,6 +226,7 @@ class ReflectionChain:
             propagated_feedback=None,
             depth=0,
             chat_log=chat_log,  # Pass chat log to recursive build
+            current_state=current_state,
         )
 
         # Compute optimization order (Bottom-Up)
@@ -288,6 +292,7 @@ class ReflectionChain:
         depth: int,
         parent_skill: Optional[str] = None,
         chat_log: str = "",  # Chat log from onChat events
+        current_state: Optional[Dict[str, Any]] = None,  # World snapshot at failure
     ):
         """Recursively build the reflection chain"""
         # Check depth limit
@@ -331,6 +336,7 @@ class ReflectionChain:
             children_info=skill_info.get("children_info", {}),
             propagated_feedback=propagated_feedback,
             chat_log=chat_log,  # Chat log for diagnostic info
+            current_state=current_state,  # World snapshot at failure
             is_task_specific=skill_info.get("is_task_specific", False),
             # Plan v3-rev Fix 1.A: pass refactor-derived wrapper flags so Phase 1
             # can advise redirecting fixes to the covered_by parent instead of
@@ -414,6 +420,7 @@ class ReflectionChain:
                     depth=depth + 1,
                     parent_skill=skill_name,
                     chat_log=chat_log,  # Pass chat log to children
+                    current_state=current_state,  # Same failure snapshot for children
                 )
 
     def _topological_sort_reverse(self) -> List[str]:
@@ -992,6 +999,7 @@ class TwoPhaseOptimizationPipeline:
         root_feedback_type: str = "error",
         skill_info_getter=None,
         chat_log: str = "",  # Chat log from onChat events
+        current_state: Optional[Dict[str, Any]] = None,  # World snapshot at failure
     ) -> ChainExecutionResult:
         """
         Run the complete two-phase optimization
@@ -1002,6 +1010,7 @@ class TwoPhaseOptimizationPipeline:
             root_feedback_type: feedback type
             skill_info_getter: callback that retrieves skill info
             chat_log: v7.7 Chat log containing diagnostic messages
+            current_state: world snapshot at the failure observation
 
         Returns:
             ChainExecutionResult: execution result
@@ -1014,6 +1023,7 @@ class TwoPhaseOptimizationPipeline:
             root_feedback_type=root_feedback_type,
             skill_info_getter=skill_info_getter,
             chat_log=chat_log,  # Pass chat log to reflection chain
+            current_state=current_state,
         )
         self._last_chain_result = chain_result  # expose for fix_target extraction
 

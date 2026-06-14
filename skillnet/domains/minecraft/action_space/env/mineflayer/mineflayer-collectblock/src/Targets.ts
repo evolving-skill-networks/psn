@@ -8,6 +8,13 @@ export class Targets {
   private readonly bot: Bot
   private targets: Collectable[] = []
 
+  // PATCH (skillnet): cooperative cancellation for collectAll. cancelTask used
+  // to rely on a PathStopped rejection propagating out of the loop, but with
+  // ignoreNoPath (the production default) the per-target catch swallows it and
+  // continues with the next of up to 1024 targets, so an abandoned collect
+  // keeps mining and seizing the pathfinder long after its caller timed out.
+  cancelled = false
+
   constructor (bot: Bot) {
     this.bot = bot
   }

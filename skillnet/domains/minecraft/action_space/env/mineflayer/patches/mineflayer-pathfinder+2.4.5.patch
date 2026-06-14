@@ -1,0 +1,837 @@
+diff --git a/node_modules/mineflayer-pathfinder/index.js b/node_modules/mineflayer-pathfinder/index.js
+index b38bd30..6434793
+--- a/node_modules/mineflayer-pathfinder/index.js
++++ b/node_modules/mineflayer-pathfinder/index.js
+@@ -28,6 +28,8 @@ function inject (bot) {
+   let placingBlock = null
+   let lastNodeTime = performance.now()
+   let returningPos = null
++  let deferredBlockUpdate = false
++  let lastIdleComputePos = null
+   let stopPathing = false
+   const physics = new Physics(bot)
+   const lockPlaceBlock = new Lock()
+@@ -116,8 +118,14 @@ function inject (bot) {
+ 
+   function detectDiggingStopped () {
+     digging = false
+-    bot.removeAllListeners('diggingAborted', detectDiggingStopped)
+-    bot.removeAllListeners('diggingCompleted', detectDiggingStopped)
++    // PATCH (skillnet): removeAllListeners(event, fn) IGNORES the second
++    // argument and removed EVERY listener on these events, destroying
++    // third-party dig observers (the skillnet blockActions trace,
++    // mineflayer-collectblock) after the first mid-dig path reset
++    // (deterministic repro: audit R9, sentinel listener count 1 -> 0).
++    // Remove only this handler.
++    bot.removeListener('diggingAborted', detectDiggingStopped)
++    bot.removeListener('diggingCompleted', detectDiggingStopped)
+   }
+ 
+   function resetPath (reason, clearStates = true) {
+@@ -129,6 +137,15 @@ function inject (bot) {
+       bot.stopDigging()
+     }
+     placing = false
++    deferredBlockUpdate = false
++    // PATCH (skillnet) v2: the LOS return trip is in-flight move state and
++    // must not survive goal changes (capture repro: audit R2 phase 2), BUT
++    // it must survive the block_updated reset that every successful bridge
++    // placement fires on itself, or the place -> return -> place cycle
++    // breaks and the bot walks off mid-bridge (clean-bridge regression,
++    // caught in-client 2026-06-06). Physical displacement remains covered
++    // by the >2-block geometric drop at the gate.
++    if (reason !== 'block_updated') returningPos = null
+     pathUpdated = false
+     astarContext = null
+     lockEquipItem.release()
+@@ -140,6 +157,12 @@ function inject (bot) {
+   }
+ 
+   bot.pathfinder.setGoal = (goal, dynamic = false) => {
++    // PATCH (skillnet): a new goal supersedes any pending stop request.
++    // A stale stopPathing flag (stop() called while the executor was idle)
++    // used to survive into this resetPath, whose tail calls stop() and
++    // nulls stateGoal: the freshly set goal died instantly with
++    // 'Path was stopped' (audit R1 phase 3).
++    stopPathing = false
+     stateGoal = goal
+     dynamicGoal = dynamic
+     bot.emit('goal_updated', goal, dynamic)
+@@ -387,6 +410,27 @@ function inject (bot) {
+     return true
+   }
+ 
++  // PATCH (skillnet): execution-time mirror of the server's placement
++  // obstruction rule for entities other than the bot (the planner's entity
++  // collision index is a per-search snapshot and skips the bot itself; this
++  // checks live entities at the moment a placement is about to fire). Uses
++  // the SAME passable set as the planner, so any cell the executor refuses
++  // here is also refused by the next plan -- the escalation replan can only
++  // detour or noPath, never bounce back to the same placement.
++  function entityBlocksCell (cx, cy, cz) {
++    for (const id in bot.entities) {
++      const e = bot.entities[id]
++      if (!e || e === bot.entity || !e.position || e.isValid === false) continue
++      if (stateMovements.passableEntities.has(e.name) && !stateMovements.entitiesToAvoid.has(e.name)) continue
++      const w = (e.width || 0.6) / 2
++      const h = e.height || 1.8
++      if (e.position.x + w > cx && e.position.x - w < cx + 1 &&
++          e.position.y + h > cy && e.position.y < cy + 1 &&
++          e.position.z + w > cz && e.position.z - w < cz + 1) return true
++    }
++    return false
++  }
++
+   function stop () {
+     stopPathing = false
+     stateGoal = null
+@@ -397,8 +441,44 @@ function inject (bot) {
+ 
+   bot.on('blockUpdate', (oldBlock, newBlock) => {
+     if (!oldBlock || !newBlock) return
++    // PATCH (skillnet): a tower-up holds the jump to rise and its own placement
++    // (plus any near-path update: flowing water/lava, settling gravel) fires
++    // this listener; resetting nulls the path and abandons the in-flight
++    // placement (placing=false) and fullStop() re-clears the jump on re-entry,
++    // so the place never reaches apex and the tower-up stalls. The placement is
++    // intentional, so do not replan against it: skip the reset while a jump
++    // placement is in flight. The corner-pinch wedge this reset guards is a
++    // walking failure (placing false), unaffected.
++    // PATCH (skillnet) v2: skip, but do not DROP. A foreign near-path change
++    // arriving inside this window used to vanish entirely, so the executor
++    // walked the invalidated remainder and only the 3.5s stuck reset
++    // recovered it -- in the deterministic repro (audit NL1) that stale walk
++    // cascaded into a failed side-place and a fall off the tower. Record the
++    // event and replay one reset when the placement completes; the
++    // placement's OWN cell stays excluded, or every tower step would replan
++    // against its intentional block.
++    if (placing && placingBlock && placingBlock.jump) {
++      const own = oldBlock.position.x === placingBlock.x + placingBlock.dx &&
++        oldBlock.position.y === placingBlock.y + placingBlock.dy &&
++        oldBlock.position.z === placingBlock.z + placingBlock.dz
++      if (!own && isPositionNearPath(oldBlock.position, path) && oldBlock.type !== newBlock.type) {
++        deferredBlockUpdate = true
++      }
++      return
++    }
+     if (isPositionNearPath(oldBlock.position, path) && oldBlock.type !== newBlock.type) {
+-      resetPath('block_updated', false)
++      // PATCH (skillnet): clearStates=true (was false). When the world changes
++      // mid-plan (typical: bot just dug/placed a block on the path), the path
++      // is replanned but bot's stale motor inputs (forward/jump) used to be
++      // preserved across the reset. With postProcessPath occasionally producing
++      // multi-step waypoints (dy=2 with toBreak/toPlace dropped on inner moves),
++      // bot would continue forward into a wall the new plan would have dug,
++      // ending up corner-pinch wedged (fractional y/xz, og=False) where the
++      // dig branch (line 494) is gated and cannot fire. Clearing motor on
++      // world-change makes bot physics neutral for ~1 tick while pathfinder
++      // replans. Cost: ~2.2% slower flat walks (more motor stutter). Benefit:
++      // an obstacle-corridor test goes from 50% timeout to 100% success.
++      resetPath('block_updated', true)
+     }
+   })
+ 
+@@ -417,6 +497,69 @@ function inject (bot) {
+   })
+ 
+   function monitorMovement () {
++    // PATCH (skillnet, V16 wedge escape): when bot ends up corner-pinched
++    // (og=False, fractional y, |vy|<0.2 sustained), the dig branch (line 494)
++    // is gated on og=True so bot can't progress. Force a brief 'back' input
++    // (which drives bot away from wall via Minecraft physics) and HOLD it
++    // until og=True is restored, meaning bot has landed on a stable block
++    // top, then resetPath so pathfinder re-plans from the new position.
++    // No fixed-time timeout: the 'back' lasts only as long as needed for
++    // physics to dislodge bot. Cap escapes to 10 per goto so a deterministic
++    // wedge-prone plan doesn't livelock indefinitely.
++    if (path && path.length > 0 && bot.entity && stateGoal) {
++      const yFrac = bot.entity.position.y - Math.floor(bot.entity.position.y)
++      let isWedgePos = !bot.entity.onGround && yFrac > 0.05 && yFrac < 0.95 && Math.abs(bot.entity.velocity.y) < 0.2 && !bot.entity.isInWater && !bot.entity.isInLava
++      if (isWedgePos) {
++        // PATCH (skillnet): web-suspension, climbing a ladder/vine, sitting in a
++        // berry bush and riding a vehicle all produce og=false + fractional y +
++        // damped |vy| as a LEGITIMATE traversal state, not a corner-pinch.
++        // Without these exclusions the escape false-fires (e.g. a mineshaft
++        // cobweb), the forced 'back' barely moves the bot, and 10 strikes later
++        // stop() rejects the goto with PathStopped on a traversable route.
++        // isInWeb is the exact full-bounding-box web test (a feet-cell blockAt
++        // misses the lower half of a descent); ladder/vine/berry are the feet cell.
++        const fb = bot.blockAt(bot.entity.position)
++        if (bot.entity.isInWeb || bot.vehicle ||
++            (fb && (fb.name === 'sweet_berry_bush' || fb.type === ladderId || fb.type === vineId))) {
++          isWedgePos = false
++        }
++      }
++      if (isWedgePos) {
++        if (!monitorMovement._wedgeStart) monitorMovement._wedgeStart = performance.now()
++      } else {
++        monitorMovement._wedgeStart = 0
++      }
++      if (monitorMovement._wedgeStart && performance.now() - monitorMovement._wedgeStart > 1000 && !monitorMovement._escapeStart) {
++        monitorMovement._escapeCount = (monitorMovement._escapeCount || 0) + 1
++        if (monitorMovement._escapeCount > 10) {
++          stop()
++          monitorMovement._escapeCount = 0
++          monitorMovement._wedgeStart = 0
++          monitorMovement._escapeStart = 0
++          return
++        }
++        monitorMovement._escapeStart = performance.now()
++        monitorMovement._wedgeStart = 0
++        bot.clearControlStates()
++        bot.setControlState('back', true)
++        // Don't resetPath yet; let bot physics land first
++      }
++      if (monitorMovement._escapeStart) {
++        const elapsed = performance.now() - monitorMovement._escapeStart
++        // Stop 'back' as soon as bot lands (og=True), or after 1.5s safety cap
++        if (bot.entity.onGround || elapsed > 1500) {
++          bot.setControlState('back', false)
++          monitorMovement._escapeStart = 0
++          resetPath('wedge_escape')
++        } else {
++          return
++        }
++      }
++    }
++    if (stateGoal !== monitorMovement._lastGoal) {
++      monitorMovement._escapeCount = 0
++      monitorMovement._lastGoal = stateGoal
++    }
+     // Test freemotion
+     if (stateMovements && stateMovements.allowFreeMotion && stateGoal && stateGoal.entity) {
+       const target = stateGoal.entity
+@@ -449,12 +592,47 @@ function inject (bot) {
+     }
+ 
+     if (bot.pathfinder.LOSWhenPlacingBlocks && returningPos) {
+-      if (!moveToBlock(returningPos)) return
+-      returningPos = null
++      // PATCH (skillnet): this gate sits above every other executor action,
++      // so it must not outrank a stop request, and it must not chase an
++      // unreachable point. The return trip is LOS bookkeeping for the next
++      // placement: after a real displacement (knockback, fall) the point
++      // can be unreachable by straight walking and the gate captured the
++      // executor forever (deterministic repro: audit R2 phase 1). Beyond a
++      // single step of drift, drop it and let normal pathing resume.
++      if (stopPathing) {
++        returningPos = null
++        return stop()
++      }
++      if (bot.entity.position.distanceTo(returningPos) > 2) {
++        returningPos = null
++      } else if (Math.abs(bot.entity.position.y - returningPos.y) > 0.45) {
++        // PATCH (skillnet): off the walking plane, the 3D deadband of
++        // moveToBlock can never close (it walks, it cannot climb), so a
++        // displacement DOWN inside the 2-block ball captured the executor
++        // forever: forward held into a wall, the goto pending silently
++        // (deterministic repro: audit NR2). A legitimate return trip stays
++        // on the plane -- the planner only emits returnPos from
++        // getMoveJumpUp's support place, whose standing y-offset is bounded
++        // by the 1.2-rise prune (movements.js:355) to well under this
++        // threshold. Off-plane means physically displaced: drop the trip
++        // and let normal pathing replan from where the bot really is.
++        returningPos = null
++      } else {
++        if (!moveToBlock(returningPos)) return
++        returningPos = null
++      }
+     }
+ 
+     if (path.length === 0) {
+       lastNodeTime = performance.now()
++      // PATCH (skillnet): consume a pending stop() while idle. stopPathing
++      // used to be consumed only inside resetPath or at node arrival; with
++      // an empty path neither runs, so stop() never emitted path_stop, the
++      // goto pended forever, and the stale flag killed the NEXT setGoal
++      // through its resetPath (deterministic repro: audit R1, phases 2-3).
++      if (stopPathing) {
++        return stop()
++      }
+       if (stateGoal && stateMovements) {
+         if (stateGoal.isEnd(bot.entity.position.floored())) {
+           if (!dynamicGoal) {
+@@ -462,7 +640,18 @@ function inject (bot) {
+             stateGoal = null
+             fullStop()
+           }
+-        } else if (!pathUpdated) {
++        } else if (!pathUpdated || !lastIdleComputePos ||
++            !lastIdleComputePos.equals(bot.entity.position.floored())) {
++          // PATCH (skillnet): pathUpdated alone latched this branch shut.
++          // After the bot consumed a path whose endpoint no longer
++          // satisfies the goal (world-dependent goals, partial tails), no
++          // recompute could ever run again: a silent permanent freeze
++          // (audit R1 phase 1). Re-arm the compute whenever the bot stands
++          // somewhere it has not computed from; a stationary bot with an
++          // unreachable goal still computes only once, so there is no
++          // per-tick A* spam, and the definitive noPath/timeout status
++          // settles the goto.
++          lastIdleComputePos = bot.entity.position.floored()
+           const results = bot.pathfinder.getPathTo(stateMovements, stateGoal)
+           bot.emit('path_update', results)
+           path = results.path
+@@ -481,10 +670,31 @@ function inject (bot) {
+ 
+     // Handle digging
+     if (digging || nextPoint.toBreak.length > 0) {
+-      if (!digging && bot.entity.onGround) {
++      // PATCH (skillnet): the onGround-only gate never starts a dig while
++      // the bot floats (swimming keeps onGround false; a bubble column or
++      // deep water keeps it false indefinitely), leaving a toBreak path in
++      // an endless stuck-reset cycle: dig never starts, goto never settles
++      // (deterministic repro: audit R4, aquifer pool). Water is a stable
++      // digging stance in vanilla, so allow it.
++      if (!digging && (bot.entity.onGround || bot.entity.isInWater)) {
+         digging = true
+         const b = nextPoint.toBreak.shift()
+         const block = bot.blockAt(new Vec3(b.x, b.y, b.z), false)
++        if (!block) {
++          // PATCH (skillnet): blockAt returns null on a chunk-unload / teleport
++          // race; bestHarvestTool would then dereference null.digTime and throw
++          // synchronously in this physicsTick listener, leaving digging=true
++          // with no dig ever started -- no event can clear it, so the executor
++          // returns at the dig gate for every future goal (process-permanent
++          // death). Clear digging first (resetPath relies on a dig event that
++          // will never fire here) and replan: the planner treats the null cell
++          // as impassable, routing around or noPath, and self-heals when the
++          // chunk reloads. Distinct reason so telemetry separates a chunk race
++          // from a genuine dig failure.
++          digging = false
++          resetPath('dig_null_block')
++          return
++        }
+         const tool = bot.pathfinder.bestHarvestTool(block)
+         fullStop()
+ 
+@@ -512,10 +722,38 @@ function inject (bot) {
+     // Handle block placement
+     // TODO: sneak when placing or make sure the block is not interactive
+     if (placing || nextPoint.toPlace.length > 0) {
++      // PATCH (skillnet): consume a pending stop() before any placing work.
++      // Nothing inside this branch checks stopPathing, and every other
++      // consumer (returningPos gate, empty-path idle, node arrival, the
++      // futility reset) sits where a placing tick cannot reach, so a stop()
++      // issued during a placement wait was dead until some resetPath ran --
++      // up to the full ~5s blockUpdate timeout behind a server-rejected
++      // placement (deterministic repro: audit NL2, 4.5s stop-to-settle).
++      // Stopping here is safe: stop() empties the path, so the next tick
++      // early-returns before this branch, and any in-flight place promise
++      // still releases its own locks and the placing flag in its finalizer.
++      if (stopPathing) {
++        return stop()
++      }
+       if (!placing) {
+         placing = true
+         placingBlock = nextPoint.toPlace.shift()
+         fullStop()
++        // PATCH (skillnet): pre-equip scaffolding on the ground before tower-up jump.
++        // Without this, equip happens inside the ~150ms jump-peak window, where
++        // async equip + placeBlock often miss the window and the bot jumps many
++        // times before a block lands. The downstream equip() below is kept as a
++        // safety net for when this pre-equip is skipped (lock held elsewhere).
++        if (placingBlock.jump && lockEquipItem.tryAcquire()) {
++          const sb = stateMovements.getScaffoldingItem()
++          if (sb) {
++            bot.equip(sb, 'hand')
++              .catch(_ignoreError => {})
++              .finally(() => lockEquipItem.release())
++          } else {
++            lockEquipItem.release()
++          }
++        }
+       }
+ 
+       // Open gates or doors
+@@ -540,35 +778,287 @@ function inject (bot) {
+       }
+       let canPlace = true
+       if (placingBlock.jump) {
+-        bot.setControlState('jump', true)
+-        canPlace = placingBlock.y + 1 < bot.entity.position.y
++        // PATCH (skillnet) v2.2: physical placement predicate + precondition
++        // establishment.
++        // History: upstream gated on `placingBlock.y + 1 < bot.y`, which
++        // fires the moment feet leave the node while the 1.8m body still
++        // overlaps the target cell -> server silent-reject + 5s blockUpdate
++        // wait (bouncing). The first skillnet patch tightened it to `+ 2`
++        // (place at the jump apex), which cured the bounce but demands a
++        // >1.0-block rise: when an external displacement (knockback, server
++        // position correction, wall-slide drift) parks the bot under a low
++        // ceiling mid-move, that rise is unachievable and the executor
++        // livelocked forever -- jump held, zero place attempts, the futility
++        // check below unreachable (deterministic repro E1/E2, 2026-06-06).
++        // v2 replaced the threshold with the condition the server itself
++        // enforces: a placement is legal iff the bot's bounding box does not
++        // intersect the target cell. v2.1 adds the missing precondition
++        // logic for the intersecting case (repro T2): a 1x1 tower-up
++        // requires the hitbox fully INSIDE the target column; when
++        // displacement leaves the bot straddling a cell boundary, a
++        // neighbor column's ceiling can cap the jump while the bot's own
++        // column scan sees open sky. Instead of jumping in that state,
++        // walk back to the column center first (the hitbox already
++        // partially occupies the column, so blocks cannot obstruct this
++        // sub-move); once centered, the single-column feasibility scan
++        // below is provably sufficient.
++        const tcx = placingBlock.x + placingBlock.dx
++        const tcy = placingBlock.y + placingBlock.dy
++        const tcz = placingBlock.z + placingBlock.dz
++        const ppos = bot.entity.position
++        const HALF_W = 0.3
++        const HEIGHT = 1.8
++        const intersects =
++          ppos.x + HALF_W > tcx && ppos.x - HALF_W < tcx + 1 &&
++          ppos.y + HEIGHT > tcy && ppos.y < tcy + 1 &&
++          ppos.z + HALF_W > tcz && ppos.z - HALF_W < tcz + 1
++        const offX = tcx + 0.5 - ppos.x
++        const offZ = tcz + 0.5 - ppos.z
++        const off = Math.max(Math.abs(offX), Math.abs(offZ))
++        const risenClear = ppos.y >= tcy + 1
++        if (off <= 0.2 && risenClear) {
++          // centered over the column and risen clear of the cell: the one
++          // physically correct placement moment (jump apex).
++          canPlace = true
++          // PATCH (skillnet): real progress imminent (place about to fire) ->
++          // disarm the jump-arm futility cap. placingBlock is a fresh object
++          // per toPlace step (shift() above), so a legit multi-block tower
++          // starts each step unset and clears here on success; the cap can
++          // only trip on a step that cannot progress for 3500ms straight.
++          placingBlock._jumpHoldSince = 0
++        } else if (off <= 0.2) {
++          // centered, still inside/below the cell: keep jumping toward the
++          // apex. Geometric infeasibility, decided from world state (not a
++          // timer): clearing the cell requires rising until feet >= tcy + 1;
++          // if the lowest solid ceiling above caps the jump apex below that,
++          // no amount of jumping can ever satisfy the predicate -- replan
++          // immediately. (Centered hitbox, so one column is enough.)
++          canPlace = false
++          bot.setControlState('forward', false)
++          bot.setControlState('jump', true)
++          const fx = Math.floor(ppos.x)
++          const fy = Math.floor(ppos.y)
++          const fz = Math.floor(ppos.z)
++          let ceilingBottom = Infinity
++          for (let dy = 2; dy <= 3; dy++) {
++            const cb = bot.blockAt(new Vec3(fx, fy + dy, fz))
++            if (cb && cb.boundingBox === 'block') { ceilingBottom = fy + dy; break }
++          }
++          // Fire only on REAL ceiling collisions (pure collision geometry,
++          // no jump-physics model): a ceiling caps feet at
++          // ceilingBottom - HEIGHT. Without a ceiling this check never
++          // fires, so partial-height ground (soul sand 0.875, farmland
++          // 0.9375) and jump-modifying effects cannot produce false
++          // positives (residual-failure audit R3).
++          if (ceilingBottom !== Infinity && ceilingBottom - HEIGHT < tcy + 1) {
++            resetPath('place_unreachable')
++            return
++          }
++          // PATCH (skillnet): the global futility check is unreachable while
++          // placing (this branch returns before it) and the non-jump arm's
++          // _intersectSince cap is gated out for jump placements. A cap whose
++          // underside sits at or below tcy+1 (one block under the dy 2..3 scan
++          // window), or a stale high tcy left by a displacement DOWN mid-step,
++          // makes risenClear permanently false under open sky: this branch then
++          // holds jump forever, zero place calls, zero resets (audit NR2 1x1
++          // pit bounce, NL1 post-fall). Mirror the non-jump 3500ms cap -> replan.
++          if (!placingBlock._jumpHoldSince) placingBlock._jumpHoldSince = performance.now()
++          if (performance.now() - placingBlock._jumpHoldSince > 3500) {
++            resetPath('place_unreachable')
++            return
++          }
++        } else if (intersects) {
++          // hitbox straddles the column boundary: re-center, don't jump
++          // (the hitbox already partially occupies the column, so blocks
++          // cannot obstruct this sub-move).
++          // PATCH (skillnet): share the SAME futility clock as the centered
++          // branch above (an alternating C2<->C3 livelock accumulates one
++          // continuous cap rather than two clocks that reset on the switch).
++          if (!placingBlock._jumpHoldSince) placingBlock._jumpHoldSince = performance.now()
++          if (performance.now() - placingBlock._jumpHoldSince > 3500) {
++            resetPath('place_unreachable')
++            return
++          }
++          bot.setControlState('jump', false)
++          bot.look(Math.atan2(-offX, -offZ), 0)
++          bot.setControlState('forward', true)
++          return
++        } else {
++          // fully displaced off the column: the move's standing
++          // precondition is gone. Executing the stale placement from here
++          // can wall off passages and waste a block + a dig-back (repro:
++          // S1 self-walling observed in-client). Replan from the real
++          // position instead.
++          resetPath('place_displaced')
++          return
++        }
++      } else {
++        // PATCH (skillnet): non-jump placements (bridge supports, gap floors,
++        // top-face fills) were entirely ungated -- the packet went out from
++        // wherever the bot stood, and the server silently rejects a placement
++        // whose target cell intersects any entity collision box, INCLUDING the
++        // placing bot. Each doomed packet burns the full ~5s block-update
++        // timeout before place_error replans; the planner's entity index skips
++        // the bot itself, so self-overlap re-emits the identical move forever,
++        // and a mob that wandered in after planning costs 5s per attempt.
++        // Mirror the server's predicate before sending.
++        const tcx = placingBlock.x + placingBlock.dx
++        const tcy = placingBlock.y + placingBlock.dy
++        const tcz = placingBlock.z + placingBlock.dz
++        const ppos = bot.entity.position
++        const HALF_W = 0.3
++        const HEIGHT = 1.8
++        const selfIntersects =
++          ppos.x + HALF_W > tcx && ppos.x - HALF_W < tcx + 1 &&
++          ppos.y + HEIGHT > tcy && ppos.y < tcy + 1 &&
++          ppos.z + HALF_W > tcz && ppos.z - HALF_W < tcz + 1
++        if (selfIntersects) {
++          const own = bot.entity.position.floored()
++          if (own.x === tcx && own.y === tcy && own.z === tcz) {
++            // standing or falling inside the very cell to fill: the move's
++            // standing precondition is gone; replan from the real position
++            // (a plan from in here fills the cell via the jump branch).
++            resetPath('place_displaced')
++            return
++          }
++          // the hitbox pokes into the target cell (drift past the boundary):
++          // walk back toward the bot's own cell centre, HORIZONTALLY only --
++          // a 3D deadband can never close on partial-height ground, where the
++          // feet keep a permanent y offset to the floored cell base. Cap the
++          // condition so unforeseen geometry degrades to a replan instead of
++          // a hold (the futility check below is unreachable while placing).
++          if (!placingBlock._intersectSince) placingBlock._intersectSince = performance.now()
++          if (performance.now() - placingBlock._intersectSince > 3500) {
++            resetPath('place_displaced')
++            return
++          }
++          const ocX = own.x + 0.5 - ppos.x
++          const ocZ = own.z + 0.5 - ppos.z
++          if (Math.max(Math.abs(ocX), Math.abs(ocZ)) > 0.2) {
++            bot.setControlState('jump', false)
++            bot.look(Math.atan2(-ocX, -ocZ), 0)
++            bot.setControlState('forward', true)
++          } else {
++            bot.setControlState('forward', false)
++          }
++          return
++        }
++        placingBlock._intersectSince = 0
++        // a parked entity in the target cell makes the place server-doomed:
++        // hold without sending the packet (the place fires the instant the
++        // cell clears) and, past the ~5s the doomed packet would have burned
++        // anyway, escalate to the same replan today's timeout produced -- the
++        // fresh plan prices the entity and detours or noPaths.
++        if (entityBlocksCell(tcx, tcy, tcz)) {
++          if (!placingBlock._entityBlockedSince) placingBlock._entityBlockedSince = performance.now()
++          if (performance.now() - placingBlock._entityBlockedSince > 5000) {
++            resetPath('place_blocked_entity')
++          }
++          return
++        }
++        placingBlock._entityBlockedSince = 0
+       }
+       if (canPlace) {
+         if (!lockEquipItem.tryAcquire()) return
++        // PATCH (skillnet): the rejection handler below may only release
++        // what THIS chain acquired. The locks are sequential, so while a
++        // place's blockUpdate confirm is in flight (~5s, lockPlaceBlock
++        // held), the monitor re-enters and runs a fresh equip each tick; a
++        // rejection there used to release the IN-FLIGHT place's lock, and
++        // the next apex fired a second packet for the same cell while the
++        // first was unconfirmed (deterministic repro: audit NL3, 2 stolen
++        // packets in one 6s window).
++        let acquiredPlaceLock = false
+         bot.equip(block, 'hand')
+           .then(function () {
+             lockEquipItem.release()
+             const refBlock = bot.blockAt(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z), false)
+             if (!lockPlaceBlock.tryAcquire()) return
++            acquiredPlaceLock = true
+             if (interactableBlocks.includes(refBlock.name)) {
+               bot.setControlState('sneak', true)
+             }
+-            bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
++            // PATCH (skillnet): use _placeBlockWithOptions with forceLook:true.
++            // The 2-arg form bot.placeBlock(...) routes through _genericPlace which
++            // does an awaited bot.lookAt(target, undefined), smooth interpolation.
++            // When the previous move dug a horizontal block (yaw rotated 90/180°),
++            // smooth lookAt takes ~1s (21 physicsTicks) to converge. During that
++            // 1s, bot falls from jump apex back to ground; by the time block_place
++            // packet sends, bot's body is inside the dest cell and the server
++            // silent-rejects (no blockUpdate). mineflayer then waits 5s on the
++            // blockUpdate it'll never get, holding lockPlaceBlock the whole time
++            // which manifests as bot bouncing in place and pathfinder hitting
++            // its own 5s thinkTimeout. forceLook:true makes lookAt instant
++            // (single tick), so the place packet sends in the same tick canPlace
++            // was checked, while bot is still at apex. (Validated by V5 reproducer
++            // /tmp/repro_p5_v5_forcelook.js: 0/21 lookAt over 0ms, 5/5 placeBlock
++            // resolved in <1ms, no bouncing.)
++            bot._placeBlockWithOptions(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz), { swingArm: 'right', forceLook: true })
+               .then(function () {
+                 // Dont release Sneak if the block placement was not successful
+                 bot.setControlState('sneak', false)
+                 if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
+               })
+               .catch(_ignoreError => {
++                // PATCH (skillnet): mineflayer's placeBlock sometimes times out
++                // waiting for a blockUpdate event even though the placement
++                // succeeded on the server (common during tower-up: bot moves
++                // out of the target slot before the event arrives). Before
++                // treating this as a hard failure and re-planning (expensive
++                // A* replan that causes the bot to hover + re-jump for ~5s
++                // per missed event), probe the world to see if the target
++                // block actually exists. If it does, treat as success.
++                const target = new Vec3(
++                  placingBlock.x + placingBlock.dx,
++                  placingBlock.y + placingBlock.dy,
++                  placingBlock.z + placingBlock.dz
++                )
++                const placed = bot.blockAt(target, false)
++                if (placed && placed.boundingBox === 'block') {
++                  bot.setControlState('sneak', false)
++                  if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
++                  return
++                }
+                 resetPath('place_error')
+               })
+               .then(() => {
+                 lockPlaceBlock.release()
+                 placing = false
+                 lastNodeTime = performance.now()
++                // PATCH (skillnet): release the rise jump with the placement.
++                // Upstream relied on the self-place block_updated reset to
++                // clear it via clearControlStates, but that reset is skipped
++                // while a jump placement is in flight, so the jump stayed
++                // latched through the following walk -- the bunny-hop carries
++                // the bot off narrow paths (audit NL1 pass B: ledge fall,
++                // twice). The next tower step re-arms its own jump.
++                if (placingBlock && placingBlock.jump) bot.setControlState('jump', false)
++                // PATCH (skillnet): replay the one world change the jump
++                // window deferred, now that the place is complete and the
++                // rise is no longer starvable (audit NL1). returningPos
++                // survives a block_updated reset by design.
++                if (deferredBlockUpdate) {
++                  deferredBlockUpdate = false
++                  resetPath('block_updated', true)
++                }
+               })
+           })
+-          .catch(_ignoreError => {})
++          .catch(_ignoreError => {
++            // PATCH (skillnet): an equip rejection (inventory desync, the
++            // stack moved between getScaffoldingItem and equip, a concurrent
++            // equip from skill code) or a synchronous throw inside the
++            // fulfillment body used to be swallowed WITHOUT releasing the
++            // sequence locks; every later placing tick then failed
++            // tryAcquire and the executor spun forever (jump held, zero
++            // packets, goto pending). Return the sequence locks so the next
++            // tick retries the equip-place sequence cleanly. release() is
++            // idempotent, so this is safe when the equip lock was already
++            // released by the fulfillment handler. v2: the place lock is
++            // returned ONLY when this chain holds it (audit NL3 -- see the
++            // acquiredPlaceLock note above).
++            lockEquipItem.release()
++            if (acquiredPlaceLock) lockPlaceBlock.release()
++          })
+       }
+       return
+     }
+@@ -609,7 +1099,20 @@ function inject (bot) {
+     bot.setControlState('jump', false)
+ 
+     if (bot.entity.isInWater) {
+-      bot.setControlState('jump', true)
++      // PATCH (skillnet): the unconditional jump here meant "always swim
++      // up", so a node BELOW the bot in water could never be reached: the
++      // executor cycled stuck-resets forever while the bot treaded water
++      // (deterministic repro: audit R4 arena, aquifer over a dig site).
++      // Swim toward the node instead: rise only when it is at or above,
++      // sink toward lower nodes, and sneak when it is clearly below so
++      // descent also works against bubble-column updrafts.
++      // Rise only when the node is clearly ABOVE; the previous
++      // !wantDown formulation kept jump on at the node's own level,
++      // pinning the bot at the surface half a block over its target
++      // while futility resets thrashed its heading (observed: 45s of
++      // node-orbiting in a 3x3 pool, then drowning).
++      bot.setControlState('jump', nextPoint.y > p.y + 0.25)
++      bot.setControlState('sneak', nextPoint.y < p.y - 1)
+       bot.setControlState('sprint', false)
+     } else if (stateMovements.allowSprinting && physics.canStraightLine(path, true)) {
+       bot.setControlState('jump', false)
+diff --git a/node_modules/mineflayer-pathfinder/lib/astar.js b/node_modules/mineflayer-pathfinder/lib/astar.js
+index e7a82cb..2684861
+--- a/node_modules/mineflayer-pathfinder/lib/astar.js
++++ b/node_modules/mineflayer-pathfinder/lib/astar.js
+@@ -39,6 +39,7 @@ class AStar {
+     this.timeout = timeout
+     this.tickTimeout = tickTimeout
+ 
++    this.computeTimeMs = 0
+     this.closedDataSet = new Set()
+     this.openHeap = new Heap()
+     this.openDataMap = new Map()
+@@ -66,16 +67,27 @@ class AStar {
+ 
+   compute () {
+     const computeStartTime = performance.now()
++    // PATCH (skillnet): bill the think budget by COMPUTE TIME actually
++    // consumed across slices, not wall-clock since construction. The executor
++    // reuses one context across physics ticks while the bot WALKS the partial
++    // tail, so wall billing charged the whole walk against the budget and a
++    // long route "timed out" mid-walk while the bot was demonstrably
++    // progressing -- a false failure verdict for the caller. A timeout now
++    // means the search genuinely spent the budget computing.
++    const billed = (status, node) => {
++      this.computeTimeMs += performance.now() - computeStartTime
++      return this.makeResult(status, node)
++    }
+     while (!this.openHeap.isEmpty()) {
+       if (performance.now() - computeStartTime > this.tickTimeout) { // compute time per tick
+-        return this.makeResult('partial', this.bestNode)
++        return billed('partial', this.bestNode)
+       }
+-      if (performance.now() - this.startTime > this.timeout) { // total compute time
+-        return this.makeResult('timeout', this.bestNode)
++      if (this.computeTimeMs + (performance.now() - computeStartTime) > this.timeout) { // total compute time
++        return billed('timeout', this.bestNode)
+       }
+       const node = this.openHeap.pop()
+       if (this.goal.isEnd(node.data)) {
+-        return this.makeResult('success', node)
++        return billed('success', node)
+       }
+       // not done yet
+       this.openDataMap.delete(node.data.hash)
+@@ -118,7 +130,7 @@ class AStar {
+       }
+     }
+     // all the neighbors of every accessible node have been exhausted
+-    return this.makeResult('noPath', this.bestNode)
++    return billed('noPath', this.bestNode)
+   }
+ }
+ 
+diff --git a/node_modules/mineflayer-pathfinder/lib/goals.js b/node_modules/mineflayer-pathfinder/lib/goals.js
+index cc6d875..da3461b
+--- a/node_modules/mineflayer-pathfinder/lib/goals.js
++++ b/node_modules/mineflayer-pathfinder/lib/goals.js
+@@ -172,7 +172,17 @@ class GoalLookAtBlock extends Goal {
+   }
+ 
+   isEnd (node) {
+-    if (node.distanceTo(this.pos.offset(0, this.entityHeight, 0)) > this.reach) return false
++    // PATCH (skillnet): measure reach from the node's eye to the block centre,
++    // not from the node's feet to the block raised by entityHeight. The stock
++    // expression added the eye height to the target, flipping the sign of the
++    // vertical term: a block 3 above the feet plane then yields a vertical
++    // term above reach for every standable node, so isEnd is false world-wide
++    // and A* returns a spurious noPath even though the block is in reach. This
++    // pre-check is only a cheap filter for the raycast below (the real reach
++    // gate, which starts from the same eye point); the +0.5 keeps it strictly
++    // conservative so it never rejects a node the raycast would accept.
++    const eye = new Vec3(node.x + 0.5, node.y + this.entityHeight, node.z + 0.5)
++    if (eye.distanceTo(this.pos.offset(0.5, 0.5, 0.5)) > this.reach + 0.5) return false
+     // Check faces that could be seen from the current position. If the delta is smaller then 0.5 that means the bot cam most likely not see the face as the block is 1 block thick
+     // this could be false for blocks that have a smaller bounding box then 1x1x1
+     const dx = node.x - (this.pos.x + 0.5)
+diff --git a/node_modules/mineflayer-pathfinder/lib/goto.js b/node_modules/mineflayer-pathfinder/lib/goto.js
+index 0b8b9de..8e45615
+--- a/node_modules/mineflayer-pathfinder/lib/goto.js
++++ b/node_modules/mineflayer-pathfinder/lib/goto.js
+@@ -20,15 +20,43 @@ function goto (bot, goal) {
+     }
+ 
+     function noPathListener (results) {
+-      if (results.path.length === 0) {
+-        cleanup()
+-      } else if (results.status === 'noPath') {
++      // PATCH (skillnet): the status must be checked BEFORE the empty-path
++      // success shortcut. An A* result with an empty path and status
++      // 'noPath' (enclosed bot, no tool) or 'timeout' used to resolve this
++      // promise as SUCCESS with the bot never having moved, corrupting
++      // every caller that trusts goto's verdict. An empty path only means
++      // success when the computation succeeded, i.e. the start position
++      // already satisfies the goal. Empty 'partial' results settle nothing:
++      // the recompute loop will deliver a definitive status.
++      if (results.status === 'noPath') {
++        clearOwnGoalSoon()
+         cleanup(error('NoPath', 'No path to the goal!'))
+       } else if (results.status === 'timeout') {
++        clearOwnGoalSoon()
+         cleanup(error('Timeout', 'Took to long to decide path to goal!'))
++      } else if (results.path.length === 0 && results.status === 'success') {
++        cleanup()
+       }
+     }
+ 
++    // PATCH (skillnet): a terminal noPath/timeout result still carries the
++    // bestNode partial path, and the executor assigns path = results.path
++    // AFTER the path_update emit returns, so the goal and the closest-approach
++    // tail used to survive the rejection: the executor kept walking and
++    // replanning toward the failed goal while the caller had already recorded
++    // the failure (a ghost run that persists across steps; nothing else clears
++    // it for raw-goto callers). A synchronous setGoal(null) here would be
++    // overwritten by that same post-emit assignment, so defer one macrotask:
++    // it runs after the delivering tick (the path wipe sticks) and, by timer
++    // FIFO order, BEFORE the settle scheduled in cleanup(), so no caller retry
++    // can interleave and be clobbered. The identity guard leaves any goal a
++    // new owner set in the meantime alone.
++    function clearOwnGoalSoon () {
++      setTimeout(() => {
++        if (bot.pathfinder.goal === goal) bot.pathfinder.setGoal(null)
++      }, 0)
++    }
++
+     function goalChangedListener (newGoal) {
+       if (newGoal !== goal) {
+         cleanup(error('GoalChanged', 'The goal was changed before it could be completed!'))
+diff --git a/node_modules/mineflayer-pathfinder/lib/movements.js b/node_modules/mineflayer-pathfinder/lib/movements.js
+index a7e3505..8baba0d
+--- a/node_modules/mineflayer-pathfinder/lib/movements.js
++++ b/node_modules/mineflayer-pathfinder/lib/movements.js
+@@ -55,6 +55,7 @@ class Movements {
+     this.liquids = new Set()
+     this.liquids.add(registry.blocksByName.water.id)
+     this.liquids.add(registry.blocksByName.lava.id)
++    this.lavaId = registry.blocksByName.lava.id
+ 
+     this.gravityBlocks = new Set()
+     this.gravityBlocks.add(registry.blocksByName.sand.id)
+@@ -255,12 +256,17 @@ class Movements {
+     }
+ 
+     if (this.dontCreateFlow) {
+-      // false if next to liquid
+-      if (this.getBlock(block.position, 0, 1, 0).liquid) return false
+-      if (this.getBlock(block.position, -1, 0, 0).liquid) return false
+-      if (this.getBlock(block.position, 1, 0, 0).liquid) return false
+-      if (this.getBlock(block.position, 0, 0, -1).liquid) return false
+-      if (this.getBlock(block.position, 0, 0, 1).liquid) return false
++      // PATCH (skillnet): differentiate the liquids instead of refusing
++      // both. Breaking next to LAVA stays forbidden: a lava flow burns the
++      // bot and the drops, and diamond-depth corridors are full of it.
++      // WATER flows are survivable and refusing them made every aquifer
++      // unminable (the planner returned noPath for any dig touching
++      // water), so water adjacency is allowed.
++      const offs = [[0, 1, 0], [-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]]
++      for (const [dx, dy, dz] of offs) {
++        const a = this.getBlock(block.position, dx, dy, dz)
++        if (a.liquid && a.type === this.lavaId) return false
++      }
+     }
+ 
+     if (this.dontMineUnderFallingBlock) {
+@@ -513,7 +519,13 @@ class Movements {
+     cost += this.safeOrBreak(block0, toBreak)
+     if (cost > 100) return
+ 
+-    if (this.getBlock(node, 0, 0, 0).liquid) return // dont go underwater
++    // PATCH (skillnet): was `if (this.getBlock(node, 0, 0, 0).liquid) return // dont go underwater`.
++    // The unconditional guard made every descent that starts in water unplannable
++    // (instant noPath), even when digging the pool floor is the only route down.
++    // Allow water (the executor's directional swim handles submerged descent);
++    // still refuse lava, consistent with safeToBreak's water-permissive/lava-strict rule.
++    const nodeBlock = this.getBlock(node, 0, 0, 0)
++    if (nodeBlock.liquid && nodeBlock.type === this.lavaId) return // dont go down in lava
+ 
+     cost += this.getNumEntitiesAt(blockLand.position, 0, 0, 0) * this.entityCost // add cost for entities
+ 

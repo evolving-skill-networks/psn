@@ -21,14 +21,14 @@ class SkillNetEnv(gym.Env):
         mc_port=None,
         server_host="http://127.0.0.1",
         server_port=3000,
-        # Sits above the mineflayer /step wall-clock guardrail (240s, see
+        # Sits above the mineflayer /step wall-clock guardrail (600s, see
         # index.js PSN_STEP_WALLCLOCK_SEC) so the server self-aborts a wedged
         # step and replies with a 500 BEFORE this read-timeout fires. The
         # timeout is the backstop for the one case the guardrail can't catch:
         # a fully synchronous busy-loop that blocks node's event loop so its
-        # own setTimeout never runs. Then this caps the dead-wait at 300s
-        # (was 900s) and the next step() restarts the wedged process.
-        request_timeout=300,
+        # own setTimeout never runs. Then this caps the dead-wait at 660s
+        # and the next step() restarts the wedged process.
+        request_timeout=660,
         log_path="./logs",
     ):
         if not mc_port:

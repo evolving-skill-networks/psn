@@ -1,0 +1,237 @@
+diff --git a/node_modules/mineflayer/lib/plugins/digging.js b/node_modules/mineflayer/lib/plugins/digging.js
+old mode 100644
+new mode 100755
+index 39d3efb..1078d51
+--- a/node_modules/mineflayer/lib/plugins/digging.js
++++ b/node_modules/mineflayer/lib/plugins/digging.js
+@@ -205,9 +205,18 @@ function inject (bot) {
+     await diggingTask.promise
+   }
+ 
++  // PATCH (skillnet): upstream purged EVERY listener on both dig events here
++  // (removeAllListeners), destroying third-party observers on the first
++  // death: the persistent blockActions trace went silent for the rest of the
++  // process while blockPlaced kept recording -- an asymmetric, misleading
++  // trace -- and the purge ran BEFORE stopDigging, so the death-time
++  // diggingAborted was emitted to nobody. digging.js registers no listeners
++  // of its own on these events, and every consumer in this stack manages its
++  // own lifecycle (the pathfinder's detectDiggingStopped self-removes,
++  // collectblock uses TemporarySubscriber cleanup, blockActions is persistent
++  // by design). stopDigging alone fully unwinds an in-flight dig (listener,
++  // timers, targetDigBlock, task cancel) and the abort event reaches everyone.
+   bot.on('death', () => {
+-    bot.removeAllListeners('diggingAborted')
+-    bot.removeAllListeners('diggingCompleted')
+     bot.stopDigging()
+   })
+ 
+@@ -238,11 +247,25 @@ function inject (bot) {
+       enchantments = enchantments.concat(helmetEnchantments)
+     }
+ 
++    // PATCH (skillnet): vanilla applies the 5x underwater mining penalty only
++    // when the player's eyes are in water (Entity.isEyeInFluid), not whenever
++    // the body merely touches it. mineflayer passed the whole-body
++    // bot.entity.isInWater, so a bot standing feet-deep in water with its head
++    // in the air wrongly took the 5x slowdown. Decide the penalty from the
++    // block at eye level instead: a feet-wet/head-air bot then digs at the
++    // correct dry speed, while a fully submerged bot (eye block is
++    // water/waterlogged) keeps the penalty.
++    const eyeBlock = bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0))
++    const eyeProps = (eyeBlock && eyeBlock.getProperties) ? eyeBlock.getProperties() : null
++    const eyeInWater = !!eyeBlock && (
++      eyeBlock.name === 'water' ||
++      (eyeProps != null && (eyeProps.waterlogged === true || eyeProps.waterlogged === 'true'))
++    )
+     const creative = bot.game.gameMode === 'creative'
+     return block.digTime(
+       type,
+       creative,
+-      bot.entity.isInWater,
++      eyeInWater,
+       !bot.entity.onGround,
+       enchantments,
+       bot.entity.effects
+diff --git a/node_modules/mineflayer/lib/plugins/place_block.js b/node_modules/mineflayer/lib/plugins/place_block.js
+old mode 100644
+new mode 100755
+index fdaec6b..b9e51d3
+--- a/node_modules/mineflayer/lib/plugins/place_block.js
++++ b/node_modules/mineflayer/lib/plugins/place_block.js
+@@ -2,28 +2,158 @@ const { onceWithCleanup } = require('../promise_utils')
+ 
+ module.exports = inject
+ 
++// PATCH (skillnet): the block names a placement with this held item may
++// legitimately produce at the destination cell. Success used to be "any
++// block-type change at dest", so water or lava flowing in, or gravel
++// settling there, converted a server-rejected placement into a resolved
++// success with a fabricated blockPlaced event -- both evidence channels
++// lying at once. Unknown or non-placeable items return null and keep the
++// legacy any-change semantics (flint_and_steel must stay there: its dest
++// can convert to nether_portal in the same tick).
++function expectedBlockNames (itemName, registry) {
++  if (!itemName) return null
++  const specials = {
++    water_bucket: ['water'],
++    lava_bucket: ['lava'],
++    powder_snow_bucket: ['powder_snow'],
++    redstone: ['redstone_wire'],
++    string: ['tripwire'],
++    wheat_seeds: ['wheat'],
++    beetroot_seeds: ['beetroots'],
++    melon_seeds: ['melon_stem'],
++    pumpkin_seeds: ['pumpkin_stem'],
++    carrot: ['carrots'],
++    potato: ['potatoes'],
++    sweet_berries: ['sweet_berry_bush'],
++    glow_berries: ['cave_vines'],
++    cocoa_beans: ['cocoa'],
++    bamboo: ['bamboo', 'bamboo_sapling'],
++    torchflower_seeds: ['torchflower_crop']
++  }
++  const out = new Set(specials[itemName] || [])
++  if (registry.blocksByName[itemName]) out.add(itemName)
++  // wall variants: torch -> wall_torch, oak_sign -> oak_wall_sign, ...
++  const wall = itemName.replace(/([^_]+)$/, 'wall_$1')
++  if (registry.blocksByName[wall]) out.add(wall)
++  // hanging signs deviate from the wall rule: X_hanging_sign -> X_wall_hanging_sign
++  const hang = itemName.replace(/_hanging_sign$/, '_wall_hanging_sign')
++  if (hang !== itemName && registry.blocksByName[hang]) out.add(hang)
++  return out.size > 0 ? out : null
++}
++
++// PATCH (skillnet, P4): Diagnose why a placeBlock silently failed (server
++// accepted-but-ignored OR genuinely rejected the packet with no blockUpdate
++// event). See Study 05 for the architectural rationale: primitives must
++// surface mechanistic state on failure instead of opaque timeouts.
++function _diagnosePlaceFailure (bot, refBlock, faceVector, dest) {
++  const parts = []
++  if (!bot.entity) return 'bot.entity undefined (died / disconnected)'
++  const pos = bot.entity.position
++  parts.push(`bot at (${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)})`)
++  // Is the destination cell inside the bot's bounding box? That makes the
++  // server silently reject the placement without sending any update.
++  const botXCell = Math.floor(pos.x)
++  const botZCell = Math.floor(pos.z)
++  const botFeetY = Math.floor(pos.y)
++  const botHeadY = Math.floor(pos.y + 1.8)
++  const destInBot = botXCell === dest.x && botZCell === dest.z &&
++                    dest.y >= botFeetY && dest.y <= botHeadY
++  if (destInBot) {
++    parts.push('DEST IS INSIDE BOT BOUNDING BOX (server silently rejects this)')
++  }
++  const actual = bot.blockAt(dest)
++  parts.push(`actual block at dest (${dest.x},${dest.y},${dest.z}): ${actual ? actual.name : 'null'}`)
++  if (refBlock) {
++    parts.push(`ref block: ${refBlock.name} at (${refBlock.position.x},${refBlock.position.y},${refBlock.position.z})`)
++  }
++  parts.push(`face: (${faceVector.x},${faceVector.y},${faceVector.z})`)
++  parts.push(`held: ${bot.heldItem ? bot.heldItem.name : 'empty'}`)
++  const conds = []
++  if (bot.entity.isInLava) conds.push('in_lava')
++  if (bot.entity.isInWater) conds.push('in_water')
++  if (!bot.entity.onGround) conds.push('airborne')
++  if (conds.length) parts.push(`bot state: ${conds.join(',')}`)
++  return parts.join('; ')
++}
++
+ function inject (bot) {
+   async function placeBlockWithOptions (referenceBlock, faceVector, options) {
+     const dest = referenceBlock.position.plus(faceVector)
+     let oldBlock = bot.blockAt(dest)
+-    await bot._genericPlace(referenceBlock, faceVector, options)
++    // PATCH (skillnet): expected-result predicate -- a change only counts as
++    // OUR placement when the new block is something the held item can place
++    // (incl. wall variants and bucket fluids). Captured at entry: the packet
++    // below uses the entry-time held item.
++    const heldName = (options && options.offhand)
++      ? (bot.inventory.slots[45] ? bot.inventory.slots[45].name : null)
++      : (bot.heldItem ? bot.heldItem.name : null)
++    const expected = expectedBlockNames(heldName, bot.registry)
++    const isExpectedChange = (ob, nb) =>
++      !!ob && !!nb && nb.type !== ob.type && (expected === null || expected.has(nb.name))
++
++    // PATCH (skillnet): verified-late placement rescue. The airborne place
++    // race (pillar-up at the bot's own feet) can surface as a throw or a
++    // stale no-change blockUpdate while the block actually lands a moment
++    // later. Before declaring failure, wait briefly and re-read the world;
++    // when the block did land, emit blockPlaced (keeping action traces
++    // complete) and treat the placement as the success it actually was.
++    async function probeLatePlacement () {
++      await new Promise(resolve => setTimeout(resolve, 300))
++      const probe = bot.blockAt(dest)
++      if (isExpectedChange(oldBlock, probe)) {
++        bot.emit('blockPlaced', oldBlock, probe)
++        return true
++      }
++      return false
++    }
++
++    try {
++      await bot._genericPlace(referenceBlock, faceVector, options)
++    } catch (err) {
++      if (await probeLatePlacement()) return
++      throw err
++    }
+ 
+     let newBlock = bot.blockAt(dest)
+-    if (oldBlock.type === newBlock.type) {
+-      [oldBlock, newBlock] = await onceWithCleanup(bot, `blockUpdate:${dest}`, {
+-        timeout: 5000,
+-        // Condition to wait to receive block update actually changing the block type, in case the bot receives block updates with no changes
+-        // oldBlock and newBlock will both be null when the world unloads
+-        checkCondition: (oldBlock, newBlock) => !oldBlock || !newBlock || oldBlock.type !== newBlock.type
+-      })
++    if (!isExpectedChange(oldBlock, newBlock)) {
++      // PATCH (skillnet, P4): if the blockUpdate event never arrives, the
++      // placement may have (a) actually succeeded but the event got routed
++      // elsewhere, or (b) been silently rejected by the server. Re-probe
++      // on timeout and only throw if the block is still not placed; when
++      // throwing, include a structured diagnostic so the LLM can diagnose.
++      try {
++        [oldBlock, newBlock] = await onceWithCleanup(bot, `blockUpdate:${dest}`, {
++          timeout: 5000,
++          // Condition to wait to receive block update actually changing the block type, in case the bot receives block updates with no changes
++          // oldBlock and newBlock will both be null when the world unloads
++          checkCondition: (oldBlock, newBlock) => !oldBlock || !newBlock || isExpectedChange(oldBlock, newBlock)
++        })
++      } catch (err) {
++        if (err && /did not fire within timeout/.test(err.message)) {
++          const probe = bot.blockAt(dest)
++          if (isExpectedChange(oldBlock, probe)) {
++            // Placement actually succeeded, event just didn't fire.
++            newBlock = probe
++            bot.emit('blockPlaced', oldBlock, newBlock)
++            return
++          }
++          if (await probeLatePlacement()) return
++          const diag = _diagnosePlaceFailure(bot, referenceBlock, faceVector, dest)
++          const want = expected ? ` (expected ${[...expected].join('/')})` : ''
++          throw new Error(`placeBlock timeout (blockUpdate not fired within 5s)${want}: ${diag}`)
++        }
++        throw err
++      }
+     }
+ 
+     // blockUpdate emits (null, null) when the world unloads
+     if (!oldBlock && !newBlock) {
+       return
+     }
+-    if (oldBlock?.type === newBlock.type) {
+-      throw new Error(`No block has been placed : the block is still ${oldBlock?.name}`)
++    if (!isExpectedChange(oldBlock, newBlock)) {
++      if (await probeLatePlacement()) return
++      const want = expected ? ` (expected ${[...expected].join('/')})` : ''
++      throw new Error(`No block has been placed : the block at dest is now ${newBlock ? newBlock.name : 'unloaded'}${want}`)
+     } else {
+       bot.emit('blockPlaced', oldBlock, newBlock)
+     }
+@@ -35,4 +165,7 @@ function inject (bot) {
+ 
+   bot.placeBlock = placeBlock
+   bot._placeBlockWithOptions = placeBlockWithOptions
++  // PATCH (skillnet): shared single source of truth for primitives that
++  // verify placements (placeItem's post-read must accept wall variants).
++  bot._expectedPlacedBlockNames = (itemName) => expectedBlockNames(itemName, bot.registry)
+ }

@@ -2558,7 +2558,12 @@ class SkillGraphManager(
         # The refactor will be triggered after successful validation via _trigger_delayed_refactor
         skip_refactor = info.get("skip_refactor", False)
 
-        if skip_refactor:
+        if not self.enable_refactor:
+            # Honor the global refactor toggle (--no-refactor); the delayed-refactor
+            # path checks this too, but this immediate flow must as well.
+            skip_refactor = True
+            self.logger.info(f"\033[33m[Refactor] Skipping refactor detection (refactor disabled)\033[0m")
+        elif skip_refactor:
             self.logger.info(f"\033[33m[Refactor] Skipping refactor detection (user-specified)\033[0m")
         elif not self.graph.has_node(program_name):
             # The node should already be added; skip otherwise

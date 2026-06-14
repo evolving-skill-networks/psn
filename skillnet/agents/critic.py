@@ -140,6 +140,18 @@ class CriticAgent:
             if placed_blocks:
                 observation += f"Placed blocks (during this task): {', '.join(placed_blocks)}\n\n"
 
+            # Show the dimension transition. An explicit "unchanged" line is
+            # decisive evidence for dimension-entry tasks: without it the
+            # critic used to infer entry from executed skill names alone.
+            dim_change = state_changes.get("dimension_change")
+            if dim_change:
+                before = dim_change.get("before")
+                after = dim_change.get("after")
+                if before != after:
+                    observation += f"Dimension Change (during this task): {before} -> {after}\n\n"
+                else:
+                    observation += f"Dimension (unchanged during this task): {after}\n\n"
+
         observation += chest_observation
 
         observation += f"Task: {task}\n\n"

@@ -191,6 +191,13 @@ class ReflectionInput:
     # that is crucial for correct problem diagnosis
     chat_log: str = ""
 
+    # World snapshot at the failure observation: nearby_entities ({name: distance})
+    # and the coordinate-bearing spatial cell dump ([{x, y, z, name}, ...]).
+    # Coordinate-level occupancy lets the analyzer diagnose spatial/structural
+    # causes (e.g. a cell that must stay clear is occupied) that the error
+    # string and inventory deltas alone cannot disambiguate.
+    current_state: Optional[Dict[str, Any]] = None
+
     # Task-specific wrapper flag: directs Phase 1 to focus on child_issues
     is_task_specific: bool = False
 
@@ -427,6 +434,114 @@ class LLMAnalyzer:
                 reasoning=f"LLM analysis failed: {e}",
             )
 
+    def _build_world_state_section(self, input: ReflectionInput) -> str:
+        """Render the world snapshot captured at the failure observation.
+
+        Two parts, both optional:
+        - nearby entities ({name: distance}) sorted nearest-first, so a
+          hostile in interaction range is visible to the diagnosis;
+        - the non-air cells of the spatial snapshot (per-cell {x, y, z, name}
+          centered on the bot's feet). Air cells are omitted and the cell
+          count is capped to keep the prompt small.
+        Returns "" when no usable state is present.
+        """
+        state = input.current_state if isinstance(input.current_state, dict) else None
+        if not state:
+            return ""
+
+        parts = []
+
+        entities = state.get("nearby_entities")
+        if isinstance(entities, dict) and entities:
+            numeric = [
+                (name, float(dist)) for name, dist in entities.items()
+                if isinstance(dist, (int, float))
+            ]
+            if numeric:
+                rendered = ", ".join(
+                    f"{name}: {dist:.1f}"
+                    for name, dist in sorted(numeric, key=lambda item: item[1])
+                )
+                parts.append(f"Nearby entities (name: distance in blocks): {rendered}")
+
+        spatial = state.get("spatial")
+        if isinstance(spatial, list) and spatial:
+            non_air = [
+                c for c in spatial
+                if isinstance(c, dict) and c.get("name") and c.get("name") != "air"
+                and all(isinstance(c.get(k), (int, float)) for k in ("x", "y", "z"))
+            ]
+            if non_air:
+                max_cells = 80
+                lines = [
+                    f"  ({int(c['x'])}, {int(c['y'])}, {int(c['z'])}): {c['name']}"
+                    for c in non_air[:max_cells]
+                ]
+                if len(non_air) > max_cells:
+                    lines.append(f"  ... and {len(non_air) - max_cells} more non-air cells")
+                parts.append(
+                    "Block occupancy around the bot (non-air cells of the spatial "
+                    "snapshot centered on the bot's feet; air cells omitted):\n"
+                    + "\n".join(lines)
+                )
+
+        actions = state.get("block_actions")
+        if isinstance(actions, list) and actions:
+            # Fold upstream "dropped" markers (window-level + step-cap, merged
+            # by collect_block_actions) into the omitted count so ONE line
+            # reports everything not shown.
+            dropped_earlier = 0
+            real_actions = []
+            for a in actions:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("t") == "dropped":
+                    try:
+                        dropped_earlier += int(a.get("count", 0))
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    real_actions.append(a)
+            max_actions = 40
+            shown = real_actions[-max_actions:]
+            lines = []
+            for a in shown:
+                t = a.get("t")
+                if t == "place":
+                    lines.append(f"  placed {a.get('name', 'a block')} at ({a.get('x')}, {a.get('y')}, {a.get('z')})")
+                elif t == "dig":
+                    lines.append(f"  dug a block at ({a.get('x')}, {a.get('y')}, {a.get('z')})")
+                elif t == "dig_aborted":
+                    lines.append(f"  dig of {a.get('name', 'a block')} at ({a.get('x')}, {a.get('y')}, {a.get('z')}) was aborted")
+                elif t == "collect":
+                    lines.append(f"  collected {a.get('count', 1)} {a.get('name', 'item')}")
+                elif t == "hit":
+                    lines.append(f"  hit {a.get('name', 'an entity')} ({a.get('d', '?')} blocks away)")
+                elif t == "killed":
+                    lines.append(f"  {a.get('name', 'an entity')} died nearby")
+                elif t == "bot_hurt":
+                    lines.append(f"  bot took damage (health now {a.get('hp', '?')})")
+                elif t == "forced_move":
+                    lines.append(f"  bot was force-moved to ({a.get('x')}, {a.get('y')}, {a.get('z')}) (knockback or teleport)")
+            omitted = dropped_earlier + (len(real_actions) - len(shown))
+            if omitted > 0:
+                lines.insert(0, f"  ... ({omitted} earlier actions omitted)")
+            if lines:
+                parts.append(
+                    "Bot actions during execution (ground truth recorded by the "
+                    "runtime, in order):\n" + "\n".join(lines)
+                )
+
+        if not parts:
+            return ""
+        return (
+            "\n**World State (at failure):**\n"
+            "Use the per-cell occupancy to check spatial preconditions the code "
+            "assumes (e.g. cells that must be air, support blocks, reachability), "
+            "and the action trace to see what the bot actually did.\n"
+            + "\n".join(parts)
+        )
+
     def _build_analysis_prompt(
         self,
         input: ReflectionInput,
@@ -558,6 +673,13 @@ This is the bot's chat output during execution. Pay special attention to diagnos
 ```
 {input.chat_log[:2000]}
 ```"""
+
+        # World snapshot at the failure observation: per-cell block occupancy
+        # plus nearby entities. This is the only input with coordinates, so it
+        # is what lets the analysis catch spatial/structural causes (a cell
+        # that must stay clear is occupied, a hostile mob in interaction
+        # range) that the error string cannot disambiguate.
+        world_state_section = self._build_world_state_section(input)
 
         # Phase 2: add API behavior knowledge and reasoning examples (lazy import to avoid circular deps)
         api_knowledge_section = ""
@@ -775,6 +897,7 @@ or output shaping AROUND the call to `{input.covered_by}`.
 **Feedback Type:** {input.feedback_type}
 {execution_state_section}
 {chat_log_section}
+{world_state_section}
 {biome_section}
 {children_section}
 {env_section}

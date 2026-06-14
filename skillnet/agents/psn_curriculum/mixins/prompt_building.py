@@ -193,6 +193,38 @@ class PromptBuildingMixin:
             if resource_lines:
                 lines.append("\n=== Current Resources ===")
                 lines.extend(resource_lines)
+            # Post-milestone: give the LLM the concrete already-unlocked item
+            # types plus a soft novelty steer, so it proposes genuinely new items
+            # instead of re-proposing saturated resources. Soft steer, not a hard
+            # dedup: re-gathering a known resource to craft a brand-new item is
+            # still allowed.
+            unlocked = sorted(self._get_unlocked_item_types())
+            if unlocked:
+                lines.append("\n=== Already-Unlocked Item Types ===")
+                lines.append(
+                    "You have already obtained these item types: "
+                    + ", ".join(unlocked[:40]) + "."
+                )
+                lines.append(
+                    "PREFER proposing an item that is NOT in the list "
+                    "above (something you have never obtained), OR a higher-tier "
+                    "goal built from items you already have (e.g. turn diamonds "
+                    "you own into a diamond_chestplate you do not yet have). It "
+                    "is still OK to re-gather a listed resource, but ONLY when it "
+                    "directly enables a NEW item or higher-tier goal you do not "
+                    "yet possess. Do NOT propose 'Ensure you have N <item>' for an "
+                    "item you already hold in sufficient quantity; that is "
+                    "redundant and produces nothing new."
+                )
+                # When several new items are possible the LLM tends to repeat the
+                # same one; nudge it to spread across the breadth of options (no
+                # specific items named, to avoid anchoring).
+                lines.append(
+                    "When several new items or higher-tier goals are possible, "
+                    "VARY your choice and explore breadth (different item types "
+                    "and kinds of activity) rather than always defaulting to the "
+                    "single most obvious next item."
+                )
         elif alerts:
             # Pre-milestone: keep existing CRITICAL/LOW alert logic
             filtered_alerts = []
@@ -298,9 +330,15 @@ class PromptBuildingMixin:
                     for bt in sorted(blacklisted_tasks)[:10]:
                         lines.append(f"  ✗✗ {bt}")
 
-        # Show learned skills so LLM can propose matching tasks
+        # Show learned skills.
+        # PRE-milestone: keep the "prefer tasks that match them" directive, since
+        # the tech-tree climb wants the LLM to reuse the resource sub-skills it is
+        # learning.
+        # POST-milestone: drop the block entirely. The learned skills are all
+        # already-mastered tech-tree resource skills, so listing them anchors
+        # proposals toward redoing those resources instead of exploring new ones.
         learned_skills = self._get_learned_skill_names()
-        if learned_skills:
+        if learned_skills and not all_milestones_completed:
             lines.append(f"\n=== Learned Skills (use these when possible) ===")
             lines.append("You have these reusable skills. Prefer tasks that match them:")
             for name in learned_skills[:15]:
@@ -312,6 +350,56 @@ class PromptBuildingMixin:
             lines.append(f"You are at Y={current_y:.0f} (underground). Surface features like trees and animals are not present here.")
 
         return "\n".join(lines)
+
+    def _get_unlocked_item_types(self) -> Set[str]:
+        """Deterministic set of item TYPES the agent has already obtained.
+
+        Post-milestone only (callers gate on all_milestones_completed). The
+        union of: (a) item types currently in inventory with count>0, and
+        (b) item names parsed out of completed-task strings (captures items
+        crafted/placed/consumed that are no longer in inventory). Used both to
+        render the 'Already-Unlocked Item Types' list (Fix B) AND by the
+        offline novelty metric, so the prompt and the scorer never diverge.
+        """
+        unlocked: Set[str] = set()
+        try:
+            inv = self.resource_tracker.current_inventory or {}
+            for item, count in inv.items():
+                if isinstance(count, int) and count > 0:
+                    unlocked.add(item)
+        except Exception:
+            pass
+        try:
+            completed = list(self.completed_tasks) if getattr(self, "completed_tasks", None) else []
+        except Exception:
+            completed = []
+        _verbs = ("ensure you have", "mine", "craft", "smelt", "cook",
+                  "kill", "equip", "place", "collect")
+        for t in completed:
+            try:
+                s = self._normalize_item_plurals(str(t)).lower().strip()
+            except Exception:
+                s = str(t).lower().strip()
+            for v in _verbs:
+                if s.startswith(v):
+                    s = s[len(v):].strip()
+                    break
+            m = re.match(r"^\d+\s+(.*)$", s)
+            if m:
+                s = m.group(1).strip()
+            # strip a leading article and trailing location/filler words so e.g.
+            # "place a crafting table nearby" yields "crafting_table" not
+            # "a_crafting_table_nearby".
+            s = re.sub(r"^(a|an|the)\s+", "", s)
+            s = re.sub(r"\s+(nearby|around|here|now|again|next to you)$", "", s).strip()
+            item = re.sub(r"\s+", "_", s)
+            # naive singularize (logs->log, diamonds->diamond) without touching
+            # words ending in 'ss' or short tokens.
+            if item.endswith("s") and not item.endswith("ss") and len(item) > 3:
+                item = item[:-1]
+            if item and re.match(r"^[a-z][a-z0-9_]*$", item):
+                unlocked.add(item)
+        return unlocked
 
     def _render_human_message_with_psn(
         self,
@@ -365,11 +453,90 @@ class PromptBuildingMixin:
             "Only propose a task achievable right now, with a specific item and\n"
             "quantity so success is verifiable from inventory.\n"
         )
+        # Novelty steer: the tech-tree resource tasks are already mastered, so
+        # prefer a genuinely new item type over re-stockpiling them.
+        neutral += (
+            "\nNOVELTY OVER STOCKPILING: the tech-tree resource tasks (e.g.\n"
+            "'Ensure you have N wood logs / cobblestone / iron ingots / coal /\n"
+            "diamond') are already mastered, so re-doing them yields nothing new.\n"
+            "Strongly prefer obtaining or crafting an item TYPE you have not yet\n"
+            "had, or a higher-tier product built from resources you already own.\n"
+            "The 'Already-Unlocked Item Types' list in the message below tells\n"
+            "you which item types are already done; aim outside it, or build a\n"
+            "NEW product from it. Re-gathering a known resource is acceptable\n"
+            "ONLY as a direct means to such a new item, never as the goal by\n"
+            "itself.\n"
+        )
         import re
         pattern = re.compile(r"=== CORE PRINCIPLES ===.*?(?=\n=== TASK FORMAT ===)", re.DOTALL)
-        if pattern.search(prompt):
-            return pattern.sub(neutral, prompt)
-        return prompt
+        result = pattern.sub(neutral, prompt) if pattern.search(prompt) else prompt
+
+        # Post-milestone, trim the parts of the shared prompt that are now dead
+        # weight (referencing inputs that no longer exist) or a counter-pull
+        # against novel exploration (modeling "Ensure you have N <resource>"
+        # stockpiling). Pre-milestone returns earlier, so this only runs once the
+        # tech tree is complete.
+
+        # (1) drop the resource-oriented TASK FORMAT examples + the ITEM GROUPS
+        #     section (both model resource stockpiling).
+        result = re.sub(
+            r"\nExamples of good tasks \(TARGET semantic\):.*?(?=\n=== SPECIAL SITUATIONS ===)",
+            "\n", result, flags=re.DOTALL)
+
+        # (2) targeted refinements. Each entry is (regex, replacement); patterns
+        #     use .*? + DOTALL so they are robust to source line wrapping.
+        refinements = [
+            # role list: drop the resource-alert + milestone items (ignored once
+            # milestones are complete).
+            (r"Your role is to propose the next task for the agent based on:\n"
+             r".*?(?=\n=== CORE PRINCIPLES)",
+             "Your role is to propose the next task for the agent based on its\n"
+             "current state (inventory, position, environment) and what is\n"
+             "feasible right now.\n"),
+            # drop the static UNDERGROUND block: the per-state Environment Note in
+            # the human message already conveys this.
+            (r"When UNDERGROUND \(Y < 50\):\n.*?\n\n(?=When INVENTORY FULL)", ""),
+            # inventory-full keep list: torches are no longer worth protecting.
+            (r"- Keep: tools, torches, food, valuable ores",
+             "- Keep: tools, food, valuable ores"),
+            # widen the "choose based on" state list.
+            (r"state \(inventory, biome, nearby blocks, completed tasks, failed tasks\)\.",
+             "state (inventory, biome, nearby blocks, completed tasks, failed "
+             "tasks, game progress, etc.)."),
+            # criterion 2: stronger novelty wording; drop the (redundant) "do not
+            # repeat hard-failed tasks" sentence (it is in the failed-tasks list).
+            (r"2\. FAVOR NOVEL AND INTERESTING TASKS.*?it has failed too hard\.",
+             "2. FAVOR NOVEL ITEMS: prefer obtaining or crafting an item you have\n"
+             "   never had before, or a higher-tier goal built from items you\n"
+             "   already own. Re-doing an already-mastered resource yields nothing\n"
+             "   new."),
+            # drop criterion 4 (the "only attempt what is achievable right now"
+            # constraint that discourages multi-step / ambitious goals) and
+            # renumber the following criterion.
+            (r"4\. USE YOUR RESOURCES.*?Check inventory for required ingredients first\.\n\n",
+             ""),
+            (r"5\. IGNORE LOW resource alerts", "4. IGNORE LOW resource alerts"),
+            # drop the one remaining em-dash (criterion 1) for consistency.
+            (r"1\. BE CONCRETE — a good task", "1. BE CONCRETE: a good task"),
+            # response-format: drop phantom inputs (resource alerts / milestone /
+            # suggested tasks are empty post-milestone).
+            (r"You will receive:\n.*?Based on this, provide your reasoning and task proposal\.",
+             "You will receive an environment observation (biome, blocks, "
+             "entities)\nand inventory status.\n\nBased on this, provide your "
+             "reasoning and task\nproposal."),
+            # TASK FORMAT: neutralize the resource-gathering framing (keep TARGET
+            # semantic for verifiability; add the non-gather verbs).
+            (r"\*\*\* CRITICAL: USE TARGET SEMANTIC \*\*\*.*?"
+             r"matches skill naming \(ensureLogs, ensureCobble, etc\.\)",
+             "Phrase each task as \"<verb> <quantity> <specific item>\". For "
+             "acquiring\nor gathering an item, use the TARGET form \"Ensure you "
+             "have X <item>\"\n(meaning end up with AT LEAST X in inventory), not "
+             "\"Mine X\"/\"Collect X\".\nFor making or using something, use the "
+             "natural verb: Craft, Smelt,\nCook, Kill, Equip, Place."),
+        ]
+        for pat, rep in refinements:
+            result = re.sub(pat, rep, result, flags=re.DOTALL)
+        return result
 
     def _generate_learning_context(self, task: str, learning_path: LearningPath) -> str:
         """

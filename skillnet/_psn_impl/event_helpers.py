@@ -79,3 +79,44 @@ def find_last_observe(events: Any) -> Optional[dict]:
         if unpacked and unpacked[0] == "observe" and isinstance(unpacked[1], dict):
             return unpacked[1]
     return None
+
+
+def collect_block_actions(events: Any, cap: int = 100) -> List[dict]:
+    """Collect the structured bot-action trace recorded during a step.
+
+    The mineflayer ``blockActions`` observer buffers bot-caused actions
+    (block placements/digs with coordinates, item pickups, combat events,
+    knockback) and attaches the buffer to every observation snapshot, so the
+    full trace for a step is the concatenation across all events. Keeps the
+    most recent ``cap`` entries; the tail is what matters when diagnosing
+    the failure at the end of the step.
+
+    No silent caps: the observer's per-window ``dropped`` markers and the
+    entries sliced off here are merged into ONE leading
+    ``{"t": "dropped", "count": N}`` marker, so the optimizer knows the true
+    action volume even when only the tail is shown.
+    """
+    actions: List[dict] = []
+    dropped = 0
+    for _event_type, event_data in iter_events(events):
+        if not isinstance(event_data, dict):
+            continue
+        acts = event_data.get("blockActions")
+        if not isinstance(acts, list):
+            continue
+        for a in acts:
+            if not isinstance(a, dict):
+                continue
+            if a.get("t") == "dropped":
+                try:
+                    dropped += int(a.get("count", 0))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                actions.append(a)
+    if len(actions) > cap:
+        dropped += len(actions) - cap
+        actions = actions[-cap:]
+    if dropped > 0:
+        actions.insert(0, {"t": "dropped", "count": dropped})
+    return actions

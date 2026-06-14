@@ -117,6 +117,7 @@ class PSNAgent(
             mode=config.curriculum.mode,
             warm_up=config.curriculum.warm_up,
             core_inventory_items=config.curriculum.core_inventory_items,
+            enable_postmilestone_adaptive=config.curriculum.postmilestone_adaptive_path,
         )
         print(f"\033[35m[PSN] Using PSN Curriculum Agent\033[0m")
 

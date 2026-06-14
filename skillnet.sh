@@ -48,6 +48,7 @@ show_usage() {
     echo "Feature Toggles (graph mode only):"
     echo "  --no-optimizer   Disable skill optimizer"
     echo "  --no-refactor    Disable skill refactoring"
+    echo "  --postmilestone-adaptive  Post-milestone: keep the adaptive learning-path (default: one fresh LLM task per iteration)"
     echo "  --include-skill-code  Include full skill code in action agent prompt (default: signatures only)"
     echo "  --pure-reasoning   Remove domain data injection from optimization (for evaluation)"
     echo "  --combat         Minecraft: don't force peaceful/day on reset (mobs spawn; keep manual difficulty/time)"
@@ -251,6 +252,9 @@ run_app() {
     fi
     if [[ "$NO_REFACTOR" == "true" ]]; then
         PYTHON_ARGS="$PYTHON_ARGS --no-refactor"
+    fi
+    if [[ "$POSTMILESTONE_ADAPTIVE" == "true" ]]; then
+        PYTHON_ARGS="$PYTHON_ARGS --postmilestone-adaptive"
     fi
     if [[ "$INCLUDE_SKILL_CODE" == "true" ]]; then
         PYTHON_ARGS="$PYTHON_ARGS --include-skill-code"
@@ -532,6 +536,7 @@ install_app() {
 PLANNER_MODE=""
 NO_OPTIMIZER=""
 NO_REFACTOR=""
+POSTMILESTONE_ADAPTIVE=""
 INCLUDE_SKILL_CODE=""
 COMBAT=""
 CURRICULUM_AGENT_MODE="auto"
@@ -554,6 +559,9 @@ for arg in "$@"; do
             ;;
         --no-refactor)
             NO_REFACTOR="true"
+            ;;
+        --postmilestone-adaptive)
+            POSTMILESTONE_ADAPTIVE="true"
             ;;
         --include-skill-code)
             INCLUDE_SKILL_CODE="true"

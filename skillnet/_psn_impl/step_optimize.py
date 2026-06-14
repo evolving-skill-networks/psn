@@ -7,6 +7,7 @@ Two-phase skill optimization on task failure.
 import traceback
 
 from skillnet._psn_impl.event_helpers import (
+    collect_block_actions,
     find_last_observe,
     get_event_data_dict,
     iter_events,
@@ -163,6 +164,16 @@ class StepOptimizeMixin:
                     # Extra information needed for environment diagnostics
                     "nearby_blocks": opt_observe.get("voxels", []),
                     "nearby_entities": opt_observe.get("status", {}).get("entities", {}),
+                    # Coordinate-bearing per-cell block dump (5x5x5 around the
+                    # bot's feet). Unlike the flat voxels list this carries
+                    # positions, so the optimizer can check spatial
+                    # preconditions (e.g. a cell that must stay clear is
+                    # occupied) instead of guessing from the error string.
+                    "spatial": opt_observe.get("spatial", []),
+                    # Ground-truth bot-action trace for the step (placements
+                    # and digs with coordinates, pickups, combat, knockback),
+                    # collected across all snapshots of the step.
+                    "block_actions": collect_block_actions(ctx.events),
                 }
 
             # Extract error message (check both "error" and "onError" event types)

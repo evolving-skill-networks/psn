@@ -205,6 +205,11 @@ class RefactorManagementMixin:
         if not covered_skills:
             return
 
+        # Converting covered skills to wrappers is a refactor operation; honor
+        # the global toggle (--no-refactor) so it stays off when disabled.
+        if not getattr(self, "enable_refactor", True):
+            return
+
         print(
             f"\033[36mDetected new skill {program_name} covers existing skills: "
             f"{', '.join(covered_skills)}\033[0m"

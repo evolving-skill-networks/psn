@@ -43,13 +43,19 @@ class EventProcessingMixin:
         observe_data = find_last_observe(events)
         if observe_data is not None:
             equipment_list = observe_data.get("status", {}).get("equipment", [])
-            return {
+            state = {
                 "inventory": observe_data.get("inventory", {}),
                 "position": observe_data.get("status", {}).get("position", {}),
                 "biome": observe_data.get("status", {}).get("biome", ""),
                 "equipment": self._convert_equipment_to_dict(equipment_list),
                 "nearby_blocks": observe_data.get("voxels", []),
             }
+            # Include the dimension only when the payload carries it, so
+            # events recorded before status.js emitted it parse unchanged.
+            dimension = observe_data.get("status", {}).get("dimension")
+            if dimension:
+                state["dimension"] = dimension
+            return state
 
         return None
 
@@ -121,6 +127,18 @@ class EventProcessingMixin:
             state_changes["nearby_blocks_changes"] = {
                 "added": added_blocks,
                 "removed": removed_blocks,
+            }
+
+        # Record the dimension transition whenever both sides observed it.
+        # An unchanged value is recorded too: explicit "still in X" evidence
+        # lets the critic reject skill-name-based success claims for
+        # dimension-entry tasks.
+        pre_dim = pre_state.get("dimension")
+        post_dim = post_state.get("dimension")
+        if pre_dim and post_dim:
+            state_changes["dimension_change"] = {
+                "before": pre_dim,
+                "after": post_dim,
             }
 
         # Extract placed blocks evidence.

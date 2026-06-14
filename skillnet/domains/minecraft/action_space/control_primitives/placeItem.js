@@ -67,14 +67,15 @@ async function placeItem(bot, name, position) {
             // verified by the world-state / item-count checks below
         }
         const placed = bot.blockAt(position);
-        if (placed && placed.name === name) {
-            bot.chat(`Placed ${name}`);
+        if (placedNameMatches(bot, name, placed)) {
+            bot.chat(`Placed ${name} at (${position.x}, ${position.y}, ${position.z})`);
             return;
         }
-        // false-negative tolerance: item consumed -> placement actually succeeded
+        // false-negative tolerance: item consumed -> placement actually succeeded,
+        // but the cell no longer holds it (gravity block fell, plant converted)
         const afterItem = bot.inventory.findInventoryItem(itemByName.id);
         if (!afterItem || afterItem.count < item_count) {
-            bot.chat(`Placed ${name}`);
+            bot.chat(`Placed ${name} at (${position.x}, ${position.y}, ${position.z}) but it fell or converted; the cell now holds ${placed ? placed.name : "nothing"}`);
             return;
         }
         throw new Error(`Failed to place ${name} at occupied target ${position}`);
@@ -119,7 +120,16 @@ async function placeItem(bot, name, position) {
         await gotoWithTimeout(bot, new GoalPlaceBlock(position, bot.world, {}), 30000, `place position for ${name}`);
         await bot.equip(item, "hand");
         await bot.placeBlock(referenceBlock, faceVector);
-        bot.chat(`Placed ${name}`);
+        // Gravity blocks convert to a falling entity two server ticks after the
+        // set; wait for the dust to settle so sand placed over a drop reports
+        // honestly instead of claiming the cell still holds it.
+        await bot.waitForTicks(4);
+        const placedB = bot.blockAt(position);
+        if (placedNameMatches(bot, name, placedB)) {
+            bot.chat(`Placed ${name} at (${position.x}, ${position.y}, ${position.z})`);
+        } else {
+            bot.chat(`Placed ${name} at (${position.x}, ${position.y}, ${position.z}) but it fell or converted; the cell now holds ${placedB ? placedB.name : "nothing"}`);
+        }
     } catch (err) {
         const afterItem = bot.inventory.findInventoryItem(itemByName.id);
         if (afterItem?.count === item_count) {
@@ -136,9 +146,18 @@ async function placeItem(bot, name, position) {
             throw new Error(`Failed to place ${name}: ${err.message}.${blockedNote}`);
         } else {
             // item count decreased -> placement actually succeeded (mineflayer API false negative)
-            bot.chat(`Placed ${name}`);
+            bot.chat(`Placed ${name} at (${position.x}, ${position.y}, ${position.z})`);
         }
     }
+}
+
+// The post-placement read must accept every block this item can legitimately
+// become (wall variants like torch -> wall_torch, bucket fluids); falls back
+// to exact-name matching when the place_block patch is absent.
+function placedNameMatches(bot, itemName, blk) {
+    if (!blk) return false;
+    const expected = bot._expectedPlacedBlockNames ? bot._expectedPlacedBlockNames(itemName) : null;
+    return expected ? expected.has(blk.name) : blk.name === itemName;
 }
 
 // A block cannot be placed where an entity stands. Return the entity whose body

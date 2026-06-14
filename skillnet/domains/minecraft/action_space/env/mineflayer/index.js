@@ -14,6 +14,7 @@ const Inventory = require("./lib/observation/inventory");
 const OnSave = require("./lib/observation/onSave");
 const Chests = require("./lib/observation/chests");
 const Spatial = require("./lib/observation/spatial");
+const BlockActions = require("./lib/observation/blockActions");
 const { plugin: tool } = require("mineflayer-tool");
 // Hoisted to module top so the /start handler can attach the 'raw' listener
 // synchronously, right after `mineflayer.createBot()` returns and before
@@ -26,6 +27,53 @@ const { wrapProgramsInIIFE } = require('./iife_wrap');
 
 let bot = null;
 let mcprRecorder = null;
+
+// PATCH (skillnet): step-boundary quarantine. The per-step otherError handler
+// only exists inside the /step window, so a background exception landing
+// BETWEEN steps used to crash the whole bridge process (and an unhandled
+// promise rejection crashed it even during a step -- nothing listened). Both
+// are now contained: logged, queued, and surfaced into the NEXT step's
+// observations via the onError channel (queuing instead of emitting matters:
+// an immediate emit between steps would be drained into cumulativeObs and
+// wiped at the next step's reset, and an emit during a /start connection
+// window would be mistaken for a connection failure).
+let stepInFlight = false;
+let stepEpoch = 0;
+const pendingBridgeErrors = [];
+
+function surfaceBridgeError(msg) {
+    if (stepInFlight && bot && typeof bot.event === "function") {
+        try { bot.emit("error", new Error(msg)); return; } catch (e) {}
+    }
+    pendingBridgeErrors.push(msg);
+    if (pendingBridgeErrors.length > 20) pendingBridgeErrors.shift();
+}
+
+process.on("uncaughtException", (err) => {
+    // All listeners fire, so deferring here can never block the per-step
+    // otherError; the listener count also covers the window where otherError
+    // was already removed but the step is still settling.
+    if (stepInFlight && process.listenerCount("uncaughtException") > 1) return;
+    console.error("[Bridge] Uncaught exception (no step owner):", (err && err.stack) || err);
+    surfaceBridgeError(`[between-steps] uncaught exception: ${(err && err.message) || err}`);
+});
+
+process.on("unhandledRejection", (reason) => {
+    console.error(`[Bridge] Unhandled rejection ${stepInFlight ? "during step" : "between steps"}:`,
+        (reason && reason.stack) || reason);
+    surfaceBridgeError(`[background] unhandled rejection: ${(reason && reason.message) || reason}`);
+});
+
+// Clear every actuator a skill can leave running (pathfinder goal, collect
+// task, dig, pvp attack, control states) so nothing keeps acting across step
+// boundaries and the next step's effects stay attributable to its own code.
+function quarantineActuators() {
+    try { if (bot && bot.collectBlock) bot.collectBlock.cancelTask().catch(() => {}); } catch (e) {}
+    try { if (bot && bot.pathfinder) bot.pathfinder.setGoal(null); } catch (e) {}
+    try { if (bot && bot.stopDigging) bot.stopDigging(); } catch (e) {}
+    try { if (bot && bot.pvp && bot.pvp.target && bot.pvp.forceStop) bot.pvp.forceStop(); } catch (e) {}
+    try { if (bot && bot.clearControlStates) bot.clearControlStates(); } catch (e) {}
+}
 
 const app = express();
 
@@ -381,6 +429,7 @@ app.post("/start", (req, res) => {
                 Chests,
                 BlockRecords,
                 Spatial,
+                BlockActions,
             ]);
             skills.inject(bot);
 
@@ -555,9 +604,27 @@ app.post("/start", (req, res) => {
 });
 
 app.post("/step", async (req, res) => {
+    // PATCH (skillnet): a /step with no bot used to throw synchronously in an
+    // async express-4 handler, which surfaces as an unhandled rejection.
+    if (!bot) {
+        res.status(500).json({ error: "Bot not started" });
+        return;
+    }
     // import useful package
     let response_sent = false;
     function otherError(err) {
+        // PATCH (skillnet): this can fire from a stale listener after the bot
+        // was torn down; dereferencing a null bot here would throw INSIDE an
+        // uncaughtException handler, which is fatal and bypasses every
+        // listener.
+        if (!bot) {
+            console.error("[Step] Uncaught error with no bot:", (err && err.stack) || err);
+            if (!response_sent) {
+                response_sent = true;
+                try { res.status(500).json({ error: String((err && err.message) || err) }); } catch (e) {}
+            }
+            return;
+        }
         console.log("Uncaught Error");
         bot.emit("error", handleError(err));
             bot.waitForTicks(bot.waitTicks).then(() => {
@@ -616,11 +683,14 @@ app.post("/step", async (req, res) => {
     // step: surface a 500 so the caller advances, then bot.end() so the
     // wedged skill's event-driven awaits stop resolving and it cannot make
     // further progress. Budget is overridable for tests via env.
-    // 240s: generous enough for any single legitimate skill (incl. deep
-    // mining), well under the client's request timeout so the server aborts
-    // and replies before the caller gives up. Tunable via env.
+    // 600s: gather-heavy tasks (e.g. mining scattered obsidian across a
+    // cratered field, then building and lighting a portal frame) were
+    // observed making steady progress past the previous 240s budget, which
+    // aborted legitimately-busy steps and discarded their events. Still
+    // well under the client's request timeout so the server aborts and
+    // replies before the caller gives up. Tunable via env.
     const STEP_WALLCLOCK_MS =
-        (parseInt(process.env.PSN_STEP_WALLCLOCK_SEC, 10) || 240) * 1000;
+        (parseInt(process.env.PSN_STEP_WALLCLOCK_SEC, 10) || 600) * 1000;
     const stepWallclockTimer = setTimeout(() => {
         if (response_sent) return;
         console.error(
@@ -937,6 +1007,21 @@ app.post("/step", async (req, res) => {
     bot.skillExecutions = [];
 
     try {
+        // PATCH (skillnet): epoch-stamped step ownership. A wallclock-aborted
+        // step never reaches its finally, and the client retries /step on
+        // timeouts, so a stale finally can fire while a NEWER step is live;
+        // the epoch gate keeps it from touching the live step. The entry
+        // quarantine is the backstop that actually protects attribution:
+        // whatever the previous step leaked (goal, collect task, dig, pvp,
+        // controls) is cleared before this step's code runs. Bridge errors
+        // queued between steps are flushed AFTER the cumulativeObs reset
+        // above, so they surface in THIS step's observations.
+        var myEpoch = ++stepEpoch;
+        stepInFlight = true;
+        quarantineActuators();
+        while (pendingBridgeErrors.length) {
+            try { bot.emit("error", new Error(pendingBridgeErrors.shift())); } catch (e) {}
+        }
         if (!keepPaused) {
             console.log(`[Step] Starting step execution, waiting ${bot.waitTicks} ticks...`);
             try {
@@ -1038,13 +1123,24 @@ app.post("/step", async (req, res) => {
         }
     } finally {
         clearTimeout(stepWallclockTimer);
-        bot.removeListener("physicsTick", onTick);
+        // PATCH (skillnet): the bot can be nulled mid-step (kick/disconnect);
+        // a throw here would itself become an unhandled rejection.
+        if (bot) bot.removeListener("physicsTick", onTick);
         process.off("uncaughtException", otherError);
         // Detach the disconnect-abort listeners if the step completed
         // normally; bot.once already removes itself on fire so this is a
         // no-op when the abort path actually ran.
-        bot.removeListener("end", onStepDisconnect);
-        bot.removeListener("kicked", onStepDisconnect);
+        if (bot) {
+            bot.removeListener("end", onStepDisconnect);
+            bot.removeListener("kicked", onStepDisconnect);
+        }
+        // PATCH (skillnet): only the CURRENT step may clear the flag and
+        // quarantine; a stale finally from an abandoned step must not cancel
+        // the live step's actuators.
+        if (myEpoch === stepEpoch) {
+            stepInFlight = false;
+            quarantineActuators();
+        }
     }
 
     async function evaluateCode(code, programs, skillNames = [], mcData, Vec3) {
@@ -1281,6 +1377,7 @@ app.post("/step", async (req, res) => {
                                     preState = {
                                         inventory: {},
                                         position: {x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z},
+                                        dimension: bot.game ? bot.game.dimension : undefined,
                                         equipment: {
                                             head: bot.inventory.slots[5] ? bot.inventory.slots[5].name : null,
                                             torso: bot.inventory.slots[6] ? bot.inventory.slots[6].name : null,
@@ -1324,6 +1421,7 @@ app.post("/step", async (req, res) => {
                                         postState = {
                                             inventory: {},
                                             position: {x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z},
+                                            dimension: bot.game ? bot.game.dimension : undefined,
                                             equipment: {
                                                 head: bot.inventory.slots[5] ? bot.inventory.slots[5].name : null,
                                                 torso: bot.inventory.slots[6] ? bot.inventory.slots[6].name : null,
@@ -1367,6 +1465,7 @@ app.post("/step", async (req, res) => {
                                         postState = {
                                             inventory: {},
                                             position: {x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z},
+                                            dimension: bot.game ? bot.game.dimension : undefined,
                                             equipment: {
                                                 head: bot.inventory.slots[5] ? bot.inventory.slots[5].name : null,
                                                 torso: bot.inventory.slots[6] ? bot.inventory.slots[6].name : null,

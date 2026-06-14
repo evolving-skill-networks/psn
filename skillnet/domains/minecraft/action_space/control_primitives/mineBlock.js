@@ -26,11 +26,18 @@ async function mineBlock(bot, name, count = 1) {
         count: 1024,
     });
     if (blocks.length === 0) {
-        bot.chat(`No ${name} nearby, please explore first`);
+        // Carry the search radius and position so the failure is actionable
+        // (which area was already searched) instead of a bare "nearby".
+        const p = bot.entity ? bot.entity.position : null;
+        const here = p
+            ? ` within 32 blocks of (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)})`
+            : "";
+        bot.chat(`No ${name} found${here}, please explore first`);
         _mineBlockFailCount++;
         if (_mineBlockFailCount > 10) {
             throw new Error(
-                "mineBlock failed too many times, make sure you explore before calling mineBlock"
+                `mineBlock failed too many times: no ${name} found${here} after repeated ` +
+                `searches. Explore a different area before calling mineBlock again.`
             );
         }
         return 0;
@@ -68,15 +75,33 @@ async function mineBlock(bot, name, count = 1) {
     }
 
     // P1: inventory change detection - detect "fake success" loops (Collect finish! but inventory unchanged)
-    // Record inventory count before mining
-    const getInventoryCount = () => {
+    // Count only the TARGET BLOCK'S OWN DROPS. A type-blind total let unrelated
+    // pickups (cobble from the approach tunnel, decayed-leaf junk) mask a lost
+    // target drop as success, and a tool breaking (-1) cancel a real +1 gain.
+    // The drop set is the block's loot table union its own item name; the loot
+    // lookup uses the CANONICAL block name (the env aliases LLM-favored names
+    // like lapis_lazuli_ore onto real block objects, and wall_* variants have
+    // no loot entries) so a legitimate mine is never filtered to zero.
+    const canonicalName = blockByName.name;
+    const dropNames = new Set([name, canonicalName]);
+    const dealiasedName = canonicalName.replace(/(^|_)wall_/, "$1");
+    dropNames.add(dealiasedName);
+    const loot = mcData.blockLoot &&
+        (mcData.blockLoot[canonicalName] || mcData.blockLoot[dealiasedName]);
+    if (loot && Array.isArray(loot.drops)) {
+        for (const d of loot.drops) {
+            if (d && d.item) dropNames.add(d.item);
+        }
+    }
+    const countItems = (dropsOnly) => {
         let total = 0;
         for (const item of bot.inventory.items()) {
-            total += item.count;
+            if (!dropsOnly || dropNames.has(item.name)) total += item.count;
         }
         return total;
     };
-    const inventoryBefore = getInventoryCount();
+    const dropsBefore = countItems(true);
+    const allBefore = countItems(false);
 
     await collectWithTimeout(bot, targets, {
         ignoreNoPath: true,
@@ -86,24 +111,42 @@ async function mineBlock(bot, name, count = 1) {
     // Wait for inventory sync to complete (so subsequent operations see the latest inventory state)
     await bot.waitForTicks(2);
 
-    // P1: check whether inventory has changed
-    const inventoryAfter = getInventoryCount();
-    if (inventoryAfter === inventoryBefore) {
+    // P1: check whether the TARGET'S drops changed
+    const dropsAfter = countItems(true);
+    const allAfter = countItems(false);
+    // clamp: the pathfinder can SPEND a same-name scaffolding item
+    // (stone/cobblestone are scaffolding blocks), which would otherwise
+    // produce a negative "items gained"
+    const gained = Math.max(0, dropsAfter - dropsBefore);
+    const junk = (allAfter - allBefore) - (dropsAfter - dropsBefore);
+    if (gained === 0) {
         _mineBlockZeroGainCount++;
-        console.warn(`[mineBlock] Warning: Inventory unchanged after mining ${name} (consecutive: ${_mineBlockZeroGainCount}). Bot may be stuck or items unreachable.`);
-        // Check whether bot is in water
-        if (bot.entity) {
-            const blockAtBot = bot.blockAt(bot.entity.position);
-            if (blockAtBot && blockAtBot.name.includes('water')) {
-                console.warn(`[mineBlock] Bot is in water at ${bot.entity.position}. Items may have fallen into water.`);
-                bot.chat(`I'm stuck in water and can't collect items. Need to move to a different location.`);
-            }
+        // Diagnose the observed state instead of guessing, and surface it via
+        // chat (console.warn never reaches the optimizer's feedback).
+        const p = bot.entity ? bot.entity.position : null;
+        const posStr = p
+            ? `(${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)})`
+            : "(unknown)";
+        const blockAtBot = p ? bot.blockAt(p) : null;
+        const held = bot.heldItem ? bot.heldItem.name : "an empty hand";
+        let reason;
+        if (blockAtBot && blockAtBot.name.includes("water")) {
+            reason = `the bot is in water at ${posStr}; drops likely sank or drifted away`;
+        } else if (blockAtBot && blockAtBot.name.includes("lava")) {
+            reason = `the bot is in lava at ${posStr}; drops likely burned`;
+        } else if (!targets[0].canHarvest(bot.heldItem ? bot.heldItem.type : null)) {
+            reason = `the held tool changed or broke mid-mining (now holding ${held}), which cannot harvest ${name}`;
+        } else {
+            reason = `blocks were found but no drop entered the inventory (holding ${held} at ${posStr}); the drops or remaining blocks are likely unreachable`;
         }
+        const junkNote = junk > 0
+            ? ` (picked up ${junk} unrelated items en route, which do not count toward ${name})`
+            : "";
+        bot.chat(`Mined ${name} but gained none of its drops [${[...dropNames].join("/")}]: ${reason}${junkNote} (consecutive: ${_mineBlockZeroGainCount})`);
         if (_mineBlockZeroGainCount > 3) {
             _mineBlockZeroGainCount = 0;
             throw new Error(
-                `mineBlock failed 3 consecutive times for ${name}: blocks found but nothing collected. ` +
-                `Possible causes: wrong tool, items falling into void/water, or blocks are inaccessible.`
+                `mineBlock got no ${name} drops 3 consecutive times: ${reason}.`
             );
         }
     } else {
@@ -111,6 +154,7 @@ async function mineBlock(bot, name, count = 1) {
     }
 
     bot.save(`${name}_mined`);
-    // Return actual items gained (may be less than count if blocks unreachable)
-    return inventoryAfter - inventoryBefore;
+    // Return the target's drop items actually gained (may be less than count
+    // if blocks were unreachable or drops were lost)
+    return gained;
 }

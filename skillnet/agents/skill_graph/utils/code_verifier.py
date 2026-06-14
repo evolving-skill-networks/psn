@@ -315,6 +315,18 @@ def code_has_effect_implementation(code: str, effect: "SkillEffect") -> bool:
 
     # Prefer fetching item name and operation type from state_representation
     state_repr = getattr(effect, 'state_representation', None)
+
+    # Dimension effects are world-state transitions, not item manipulations:
+    # the item-pattern strategies below can never match them. Accept when the
+    # code references the target dimension or portal machinery; runtime
+    # verification (post-state dimension) remains the authoritative check.
+    if state_repr and isinstance(state_repr, dict) and state_repr.get('type') == 'dimension':
+        target_dim = str(state_repr.get('dimension', '')).lower().replace('minecraft:', '')
+        if (target_dim and target_dim in code_lower) \
+                or 'dimension' in code_lower or 'portal' in code_lower:
+            return True
+        return False
+
     if state_repr and isinstance(state_repr, dict):
         item = state_repr.get('item', '')
         operation = state_repr.get('operation', '')  # Bug 4: fetch operation type

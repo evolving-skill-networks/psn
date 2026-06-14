@@ -24,7 +24,7 @@ def MinecraftDomain(
     mc_port=None,
     server_host="http://127.0.0.1",
     server_port=3000,
-    request_timeout=300,  # > index.js /step wall-clock guardrail (240s)
+    request_timeout=660,  # > index.js /step wall-clock guardrail (600s): the server must self-abort a wedged step and reply 500 before this read-timeout fires
     log_path="./logs",
     model_name="gpt-5-mini",
     llm=None,

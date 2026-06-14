@@ -173,6 +173,11 @@ def parse_args():
                         help='Disable skill optimizer (only applies to graph mode)')
     parser.add_argument('--no-refactor', action='store_true',
                         help='Disable skill refactoring (only applies to graph mode)')
+    parser.add_argument('--postmilestone-adaptive', action='store_true',
+                        help='After all milestones, keep the adaptive learning-path '
+                             'continuation/decomposition (old behavior). Default: each '
+                             'iteration runs a fresh LLM-proposed task for '
+                             'open-exploration breadth')
     parser.add_argument('--include-skill-code', action='store_true',
                         help='Include full skill code in action agent prompt (default: signatures only)')
     parser.add_argument('--pure-reasoning', action='store_true',
@@ -251,6 +256,7 @@ if __name__ == "__main__":
     print(f"  Planner: {planner_mode}")
     print(f"  Optimizer: {'disabled' if args.no_optimizer else 'enabled'}")
     print(f"  Refactor: {'disabled' if args.no_refactor else 'enabled'}")
+    print(f"  Post-milestone adaptive path: {'enabled' if args.postmilestone_adaptive else 'disabled'}")
     print(f"  Pure reasoning: {'enabled' if args.pure_reasoning else 'disabled'}")
     print(f"  Curriculum agent mode: {curriculum_agent_mode}")
     print(f"  Run mode: {run_mode}")
@@ -424,7 +430,10 @@ if __name__ == "__main__":
             skill_manager=LLMEndpoint(model_name=skill_manager_model),
         ),
         action=ActionConfig(include_skill_code=_include_skill_code),
-        curriculum=CurriculumConfig(mode=curriculum_agent_mode),
+        curriculum=CurriculumConfig(
+            mode=curriculum_agent_mode,
+            postmilestone_adaptive_path=args.postmilestone_adaptive,
+        ),
         planner=PlannerConfig(mode=planner_mode),
         optimization=OptimizationConfig(**opt_kwargs),
         skill_manager=SkillManagerConfig(**sm_kwargs),

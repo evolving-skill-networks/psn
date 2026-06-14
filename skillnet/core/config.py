@@ -73,6 +73,13 @@ class ActionConfig:
 class CurriculumConfig:
     """Curriculum agent configuration."""
     mode: str = "auto"
+    # Post-milestone open exploration: when True, a hard task is decomposed into
+    # an adaptive learning path that is continued across iterations. That path
+    # preempts the LLM's fresh task proposals, so a stuck path (rare mob, etc.)
+    # starves novel exploration. Default False: run one fresh LLM-proposed task
+    # per iteration; set True (--postmilestone-adaptive) to restore the old
+    # path-continuation behavior.
+    postmilestone_adaptive_path: bool = False
     warm_up: Optional[Dict[str, int]] = None
     core_inventory_items: str = (
         r".*_log|.*_planks|stick|crafting_table|furnace"

@@ -253,6 +253,23 @@ async function collectWithTimeout(bot, targets, options, count = 1, targetName =
     try {
         await withTimeout(bot.collectBlock.collect(targets, options), timeoutMs, genericMsg);
     } catch (err) {
+        // PATCH (skillnet): a timed-out race does NOT stop the wrapped
+        // collect(): the abandoned loop kept mining, swapping the held item
+        // and seizing the pathfinder during the FOLLOWING skill actions and
+        // steps, making their effects unattributable. Cancel the task and
+        // give the loop a bounded grace to confirm exit (collectBlock's
+        // cancellation is cooperative; the grace covers an in-flight dig).
+        // On a non-timeout rejection the task already cleared its targets,
+        // so cancelTask is a no-op there.
+        try {
+            if (bot.collectBlock) {
+                let graceTimer;
+                await Promise.race([
+                    bot.collectBlock.cancelTask(),
+                    new Promise((r) => { graceTimer = setTimeout(r, 15000); }),
+                ]).finally(() => clearTimeout(graceTimer));
+            }
+        } catch (e) {}
         bot.pathfinder.setGoal(null);
         // PATCH (skillnet, P3): on timeout, probe state and enrich the error
         // with structured diagnostic info so the LLM can reason about the
