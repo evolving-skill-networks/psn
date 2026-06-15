@@ -33,8 +33,6 @@ class OptimizationMixin:
     These methods delegate to helper modules and are NOT shadowed by optimizer_impl.py.
 
     Requires self attributes (from SkillGraphOptimizer):
-    - self.CRITICAL_CONFLICT_KEYWORDS: frozenset
-    - self.UNADDRESSED_ISSUE_KEYWORDS: frozenset
     - self.logger: Logger instance
     """
 

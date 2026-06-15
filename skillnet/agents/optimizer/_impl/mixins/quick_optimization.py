@@ -657,6 +657,30 @@ Analyze why the function fails for certain parameter values and fix accordingly.
         except Exception as e:
             return {"error": f"Quick optimization failed: {e}"}
 
+    def _should_reject_for_consistency(self, consistency_check):
+        """Decide whether to reject an optimization based on the consistency check.
+
+        The consistency check is LLM-based: it returns `consistent` (bool) and a
+        holistic `consistency_score` (0-1). We trust that judgment and reject only
+        when the score falls below the configured threshold. We deliberately do
+        NOT re-scan the LLM's free-text `conflicts` for keywords (the former
+        CRITICAL_CONFLICT/UNADDRESSED_ISSUE keyword layer): words like
+        "undefined"/"syntax" appear in almost any risk discussion, so prose
+        substring matching false-rejected substantively-correct optimizations.
+        The real defect classes are caught by dedicated validators, not here:
+          - truncation/incompleteness -> _validate_code_completeness (runs earlier)
+          - JS syntax errors          -> validate_code_syntax (at skill save)
+          - undefined references       -> validate_function_references (Reference Check)
+
+        Returns (reject: bool, reasons: list[str]).
+        """
+        if consistency_check.get("consistent", True):
+            return False, []
+        score = consistency_check.get("consistency_score", 0)
+        if score < self.consistency_threshold:
+            return True, [f"low score ({score:.2f} < {self.consistency_threshold})"]
+        return False, []
+
     def _validate_optimization_result(
         self,
         llm_output: Dict[str, Any],
@@ -837,21 +861,12 @@ Analyze why the function fails for certain parameter values and fix accordingly.
             self.logger.warning(f"\033[33m[Quick Optimize] Warning: optimization conflicts with recent feedback: {', '.join(conflicts)}\033[0m")
             self.logger.warning(f"\033[33m[Quick Optimize] Consistency score: {consistency_score:.2f}\033[0m")
 
-            # If the consistency score is too low or conflicts are severe, mark as retryable (P2: use configurable threshold and class constants)
-            has_critical_conflict = any(
-                kw in c.lower() for c in conflicts for kw in self.CRITICAL_CONFLICT_KEYWORDS
-            )
-            has_unaddressed_core_issue = any(
-                kw in c.lower() for c in conflicts for kw in self.UNADDRESSED_ISSUE_KEYWORDS
-            )
-            if consistency_score < self.consistency_threshold or has_critical_conflict or has_unaddressed_core_issue:
-                rejection_reasons = []
-                if consistency_score < self.consistency_threshold:
-                    rejection_reasons.append(f"low score ({consistency_score:.2f} < {self.consistency_threshold})")
-                if has_critical_conflict:
-                    rejection_reasons.append("critical code conflict")
-                if has_unaddressed_core_issue:
-                    rejection_reasons.append("core issue not addressed")
+            # Reject only on the LLM's holistic consistency score (see
+            # _should_reject_for_consistency). No keyword re-scan of the LLM's
+            # prose: that false-rejected correct optimizations; real defects are
+            # caught by the dedicated completeness/syntax/reference validators.
+            reject, rejection_reasons = self._should_reject_for_consistency(consistency_check)
+            if reject:
                 self.logger.error(
                     f"\033[31m[Quick Optimize] Rejecting optimization: {', '.join(rejection_reasons)}\033[0m"
                 )

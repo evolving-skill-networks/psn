@@ -163,24 +163,14 @@ class SkillGraphOptimizer(
     4. Execute the three-step optimization strategy
     """
     
-    # Class variable: Critical conflict keywords for consistency check
-    # Used to detect serious code issues that should reject optimization
-    CRITICAL_CONFLICT_KEYWORDS = frozenset([
-        "syntax", "incomplete", "truncated",
-        "undefined", "referenceerror", "not defined"
-    ])
+    # NOTE: the consistency check rejects on the LLM's holistic consistency_score
+    # alone (see QuickOptimizationMixin._should_reject_for_consistency). The
+    # former CRITICAL_CONFLICT_KEYWORDS / UNADDRESSED_ISSUE_KEYWORDS layer that
+    # substring-matched the LLM's free-text conflicts was removed: it false-
+    # rejected substantively-correct optimizations (any "undefined"/"syntax" in
+    # the prose triggered it), and the defect classes it claimed to catch are
+    # already covered by dedicated validators (completeness/syntax/reference).
 
-    # Class variable: Keywords indicating optimization fails to address the core issue
-    # Used to detect when LLM explicitly states the optimization misses the main problem
-    UNADDRESSED_ISSUE_KEYWORDS = frozenset([
-        "does not address",
-        "fails to address",
-        "does not fix",
-        "fails to fix",
-        "does not resolve",
-        "fails to resolve",
-    ])
-    
     def __init__(
         self,
         skill_graph_manager: "SkillGraphManager",

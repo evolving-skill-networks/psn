@@ -232,20 +232,36 @@ class HelperExtractor:
                 "update_source": f"synthesis:extracted_from_{parent_skill_name}",
             }
 
+            # Parent-safety gate: only extract if we can cleanly migrate the
+            # parent (remove the inline def AND rewrite its call sites to the
+            # extracted skill's async/bot contract, verified by the JS parser).
+            # Otherwise skip this helper entirely, so extraction never leaves the
+            # parent calling a removed/contract-mismatched helper, nor registers a
+            # same-name twin that later derails the optimizer.
+            migrated_parent, can_migrate = self._migrate_parent_for_extraction(
+                updated_code, helper.name
+            )
+            if not can_migrate:
+                print(
+                    f"\033[33m[Synthesis] Skipping extraction of '{helper.name}': "
+                    f"cannot safely migrate '{parent_skill_name}' call sites; "
+                    f"left inline to keep the parent valid\033[0m"
+                )
+                continue
+
             try:
                 registered_name = skill_manager.add_new_skill(info)
                 if registered_name:
                     helper.registered_name = registered_name
                     result.extracted.append(helper)
 
-                    updated_code = self._remove_inline_definition(
-                        updated_code, helper.name
-                    )
+                    updated_code = migrated_parent
 
                     print(
                         f"\033[32m[Synthesis] Extracted helper '{helper.name}' "
                         f"({helper.line_count} lines) from '{parent_skill_name}' "
-                        f"→ registered as '{registered_name}'\033[0m"
+                        f"→ registered as '{registered_name}' (parent calls "
+                        f"migrated to await {helper.name}(bot, ...))\033[0m"
                     )
                 else:
                     print(
@@ -281,6 +297,77 @@ class HelperExtractor:
                 )
 
         return result
+
+    def _rewrite_helper_calls_async(self, code: str, name: str) -> str:
+        """Rewrite bare ``name(args)`` call sites to ``await name(bot, args)`` so
+        they match an extracted skill's async/bot contract. Already-awaited calls
+        and property/method calls (``.name(``) are left untouched. On a malformed
+        (unbalanced) call the code is returned unchanged so the caller's
+        completeness/syntax gate rejects the migration rather than risk a bad edit.
+        """
+        pat = re.compile(r'(?<![.\w$])' + re.escape(name) + r'\s*\(')
+        out = []
+        last = 0
+        for m in pat.finditer(code):
+            open_idx = m.end() - 1
+            depth = 0
+            j = open_idx
+            while j < len(code):
+                ch = code[j]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth != 0:
+                return code  # unbalanced -> bail; migration will be rejected
+            close_idx = j
+            args = code[open_idx + 1:close_idx].strip()
+            already_awaited = code[:m.start()].rstrip().endswith('await')
+            out.append(code[last:m.start()])
+            if already_awaited:
+                out.append(code[m.start():close_idx + 1])
+            else:
+                new_args = 'bot' if args == '' else 'bot, ' + args
+                out.append(f"await {name}({new_args})")
+            last = close_idx + 1
+        out.append(code[last:])
+        return ''.join(out)
+
+    def _migrate_parent_for_extraction(self, parent_code: str, helper_name: str):
+        """Make the parent safe after extracting ``helper_name``: remove the
+        inline definition AND rewrite its call sites to ``await helper_name(bot,
+        ...)``. Returns ``(new_code, ok)``. ``ok=False`` means the migration could
+        not be done safely (a call sits in a non-async scope where awaiting it
+        would be a SyntaxError, a call could not be rewritten, or no JS parser is
+        available to verify). The caller MUST then skip the extraction, leaving
+        the parent untouched, so extraction never breaks the parent nor registers
+        an orphan same-name/different-contract twin.
+        """
+        without_def = self._remove_inline_definition(parent_code, helper_name)
+        if without_def == parent_code:
+            return parent_code, False  # inline def not found/removed -> don't extract
+        migrated = self._rewrite_helper_calls_async(without_def, helper_name)
+        # Completeness: no old-contract (non-awaited) call may remain.
+        for m in re.finditer(r'(?<![.\w$])' + re.escape(helper_name) + r'\s*\(', migrated):
+            if not migrated[:m.start()].rstrip().endswith('await'):
+                return parent_code, False
+        # Validity: the migrated parent must still parse with the real JS parser;
+        # this is what catches an `await` placed in a non-async callback.
+        try:
+            from skillnet.core.dk_registry import get_domain_knowledge
+            dk = get_domain_knowledge()
+            lang = dk.get_skill_language_impl() if dk else None
+            if lang is None:
+                return parent_code, False
+            res = lang.validate_syntax(migrated)
+            if not getattr(res, "valid", False):
+                return parent_code, False
+        except Exception:
+            return parent_code, False
+        return migrated, True
 
     def _remove_inline_definition(self, code: str, helper_name: str) -> str:
         """Strip the inline `function helper_name(...)` (sync or async)
