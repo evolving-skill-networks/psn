@@ -433,6 +433,17 @@ app.post("/start", (req, res) => {
             ]);
             skills.inject(bot);
 
+            // PSN surface-for-air watcher: an always-on physicsTick survival
+            // reflex that stops the bot drowning when it sits underwater while
+            // NOT pathfinding (idle / digging in place / just reached a submerged
+            // goal) -- the pathfinder's own in-tick breath guard is dormant then.
+            // Shared module so the regression scripts exercise identical logic.
+            try {
+                require("./psn_breath_watcher").installBreathWatcher(bot, { log: console.log });
+            } catch (e) {
+                console.error('[PSN BreathWatcher] install failed: ' + String((e && e.message) || e));
+            }
+
             if (req.body.spread) {
                 bot.chat(`/spreadplayers ~ ~ 0 300 under 80 false @s`);
                 await bot.waitForTicks(bot.waitTicks);
