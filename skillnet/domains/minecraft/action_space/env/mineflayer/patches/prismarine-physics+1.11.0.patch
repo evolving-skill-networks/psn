@@ -1,0 +1,67 @@
+diff --git a/node_modules/prismarine-physics/index.js b/node_modules/prismarine-physics/index.js
+index d95ce7f..b47db22
+--- a/node_modules/prismarine-physics/index.js
++++ b/node_modules/prismarine-physics/index.js
+@@ -490,6 +490,20 @@ function Physics (mcData, world) {
+       }
+ 
+       applyHeading(entity, strafe, forward, acceleration)
++      // PATCH (skillnet): sprint-swim. prismarine-physics never implemented the
++      // 1.13+ swimming speed boost / look-directional swim, so a bot in water is
++      // stuck at ~base speed and cannot swim down by aiming. When swimming
++      // (sprint + submerged) and giving movement input, add an impulse along the
++      // 3D look vector so the bot swims fast in the looked direction (incl. up /
++      // down). Tuned to ~vanilla sprint-swim speed. The server already treats it
++      // as swimming (from the sprint flag), so it accepts this without rubber-band.
++      if (entity.swimming && (Math.abs(forward) > 0.01 || Math.abs(strafe) > 0.01)) {
++        const sv = getLookingVector(entity)
++        const swimAccel = 0.045
++        vel.x += sv.lookX * swimAccel
++        vel.y += sv.lookY * swimAccel
++        vel.z += sv.lookZ * swimAccel
++      }
+       moveEntity(entity, world, vel.x, vel.y, vel.z)
+       vel.y *= inertia
+       vel.y -= (entity.isInWater ? physics.waterGravity : physics.lavaGravity) * gravityMultiplier
+@@ -706,12 +720,33 @@ function Physics (mcData, world) {
+     const vel = entity.vel
+     const pos = entity.pos
+ 
++    // PATCH (skillnet): swimming pose hitbox. Each tick starts at the standing
++    // height so isInWater is decided with the normal box; below, when the bot is
++    // sprint-swimming, we shrink to the 0.6 swimming box for the rest of the
++    // tick. This lets the bot fit through 1-tall underwater gaps and keeps the
++    // bot's own physics in step with the pose the server already renders from
++    // the sprint flag (mineflayer sends start_sprinting -> server setSwimming).
++    physics.playerHeight = 1.8
++
+     const waterBB = getPlayerBB(pos).contract(0.001, 0.401, 0.001)
+     const lavaBB = getPlayerBB(pos).contract(0.1, 0.4, 0.1)
+ 
+     entity.isInWater = isInWaterApplyCurrent(world, waterBB, vel)
+     entity.isInLava = isMaterialInBB(world, lavaBB, lavaIds)
+ 
++    // swimming = sprinting while submerged (mirrors the server's
++    // setSwimming(isSprinting && isInWater)).
++    let _wantSwim = !!(entity.control.sprint && entity.isInWater)
++    if (!_wantSwim && entity.swimming) {
++      // Do NOT stand back up (1.8) inside a space too short for it: that would
++      // wedge the bot in the block and suffocate it. Stay in the swim pose until
++      // there is room to stand.
++      const _standBB = getPlayerBB(pos)
++      if (getSurroundingBBs(world, _standBB).some(b => _standBB.intersects(b))) _wantSwim = true
++    }
++    entity.swimming = _wantSwim
++    if (entity.swimming) physics.playerHeight = 0.6
++
+     // Reset velocity component if it falls under the threshold
+     if (Math.abs(vel.x) < physics.negligeableVelocity) vel.x = 0
+     if (Math.abs(vel.y) < physics.negligeableVelocity) vel.y = 0
+@@ -861,6 +896,7 @@ class PlayerState {
+     bot.entity.isCollidedHorizontally = this.isCollidedHorizontally
+     bot.entity.isCollidedVertically = this.isCollidedVertically
+     bot.entity.elytraFlying = this.elytraFlying
++    bot.entity.swimming = this.swimming // PATCH (skillnet): expose swim pose (drives eye height + lets callers know)
+     bot.jumpTicks = this.jumpTicks
+     bot.jumpQueued = this.jumpQueued
+     bot.fireworkRocketDuration = this.fireworkRocketDuration

@@ -1,5 +1,5 @@
 diff --git a/node_modules/mineflayer-pathfinder/index.js b/node_modules/mineflayer-pathfinder/index.js
-index b38bd30..6434793
+index b38bd30..ac857bd
 --- a/node_modules/mineflayer-pathfinder/index.js
 +++ b/node_modules/mineflayer-pathfinder/index.js
 @@ -28,6 +28,8 @@ function inject (bot) {
@@ -121,7 +121,7 @@ index b38bd30..6434793
 +      // is replanned but bot's stale motor inputs (forward/jump) used to be
 +      // preserved across the reset. With postProcessPath occasionally producing
 +      // multi-step waypoints (dy=2 with toBreak/toPlace dropped on inner moves),
-+      // bot would continue forward into a wall the new plan would have dug,
++      // bot would continue forward into a wall the new plan would have dug —
 +      // ending up corner-pinch wedged (fractional y/xz, og=False) where the
 +      // dig branch (line 494) is gated and cannot fire. Clearing motor on
 +      // world-change makes bot physics neutral for ~1 tick while pathfinder
@@ -139,8 +139,8 @@ index b38bd30..6434793
 +    // (og=False, fractional y, |vy|<0.2 sustained), the dig branch (line 494)
 +    // is gated on og=True so bot can't progress. Force a brief 'back' input
 +    // (which drives bot away from wall via Minecraft physics) and HOLD it
-+    // until og=True is restored, meaning bot has landed on a stable block
-+    // top, then resetPath so pathfinder re-plans from the new position.
++    // until og=True is restored — meaning bot has landed on a stable block
++    // top — then resetPath so pathfinder re-plans from the new position.
 +    // No fixed-time timeout: the 'back' lasts only as long as needed for
 +    // physics to dislodge bot. Cap escapes to 10 per goto so a deterministic
 +    // wedge-prone plan doesn't livelock indefinitely.
@@ -552,14 +552,14 @@ index b38bd30..6434793
 -            bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
 +            // PATCH (skillnet): use _placeBlockWithOptions with forceLook:true.
 +            // The 2-arg form bot.placeBlock(...) routes through _genericPlace which
-+            // does an awaited bot.lookAt(target, undefined), smooth interpolation.
++            // does an awaited bot.lookAt(target, undefined) — smooth interpolation.
 +            // When the previous move dug a horizontal block (yaw rotated 90/180°),
 +            // smooth lookAt takes ~1s (21 physicsTicks) to converge. During that
 +            // 1s, bot falls from jump apex back to ground; by the time block_place
 +            // packet sends, bot's body is inside the dest cell and the server
 +            // silent-rejects (no blockUpdate). mineflayer then waits 5s on the
 +            // blockUpdate it'll never get, holding lockPlaceBlock the whole time
-+            // which manifests as bot bouncing in place and pathfinder hitting
++            // — which manifests as bot bouncing in place and pathfinder hitting
 +            // its own 5s thinkTimeout. forceLook:true makes lookAt instant
 +            // (single tick), so the place packet sends in the same tick canPlace
 +            // was checked, while bot is still at apex. (Validated by V5 reproducer
@@ -635,11 +635,17 @@ index b38bd30..6434793
        }
        return
      }
-@@ -609,7 +1099,20 @@ function inject (bot) {
+@@ -608,9 +1098,97 @@ function inject (bot) {
+     bot.setControlState('forward', true)
      bot.setControlState('jump', false)
  
++    // PATCH (skillnet): reset the breath state whenever we are not in water,
++    // so a later submersion starts fresh.
++    if (!bot.entity.isInWater) { bot._pfSubmergedSince = null; bot._pfNeedAir = false }
++
      if (bot.entity.isInWater) {
 -      bot.setControlState('jump', true)
+-      bot.setControlState('sprint', false)
 +      // PATCH (skillnet): the unconditional jump here meant "always swim
 +      // up", so a node BELOW the bot in water could never be reached: the
 +      // executor cycled stuck-resets forever while the bot treaded water
@@ -652,11 +658,83 @@ index b38bd30..6434793
 +      // pinning the bot at the surface half a block over its target
 +      // while futility resets thrashed its heading (observed: 45s of
 +      // node-orbiting in a 3x3 pool, then drowning).
-+      bot.setControlState('jump', nextPoint.y > p.y + 0.25)
-+      bot.setControlState('sneak', nextPoint.y < p.y - 1)
-       bot.setControlState('sprint', false)
++      //
++      // PATCH (skillnet): surface-for-air guard. The directional swim below
++      // happily follows a path whose nodes are at/below the bot, keeping it
++      // submerged with NO breath awareness -> it drowns in aquifers (observed
++      // PSN_Techtree4: 3 drownings at Y47-54 while iron-mining). When air runs
++      // low, override the swim to rise straight up and HOLD at the surface for
++      // air, then resume the dive once air is refilled.
++      //
++      // Signal: bot.oxygenLevel is unreliable here (it intermittently reads a
++      // bogus high value WHILE the bot is actually drowning), so we read the
++      // raw air metadata directly (entity metadata key 1 = air ticks, ~0..300,
++      // negative while taking drowning damage). Hysteresis (surface <=120,
++      // resume only >=240) guarantees a FULL breath: a 1-tick surface only
++      // partially refills air, so without it the bot re-drowns almost at once.
++      // A continuous-submersion-time backstop covers any tick the metadata is
++      // absent and bounds dive depth so we can always make it back up. While
++      // surfacing we drop `forward` so the bot holds at the top to breathe
++      // instead of chasing a submerged node. This preserves the deliberate
++      // underwater-descent capability while never drowning when air is
++      // reachable above (the common aquifer case). A fully-enclosed water
++      // ceiling with no reachable air still cannot be saved here -> that would
++      // need a goal abort, which is intentionally out of scope.
++      const AIR_LOW = 160     // raw air ticks: surface below this (~8s left; wide margin for tick lag)
++      const AIR_OK = 240      // raw air ticks: only resume the dive above this (shared with psn_breath_watcher)
++      const SUBMERGE_LIMIT_MS = 7000
++      const md = bot.entity.metadata
++      const rawAir = (md && typeof md[1] === 'number') ? md[1] : null
++      const eyeBlock = bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight || 1.62, 0))
++      const headInWater = !!(eyeBlock && eyeBlock.name === 'water')
++      const now = Date.now()
++      // Stamp that this in-tick guard is actively driving breath this tick, so
++      // the always-on watcher defers to us and only takes over when this stamp
++      // goes stale (the bot reached its goal and this movement code stopped).
++      bot._pfInTickTs = now
++      if (headInWater) { if (bot._pfSubmergedSince == null) bot._pfSubmergedSince = now } else { bot._pfSubmergedSince = null }
++      // primary trigger: real air level, with hysteresis for a full breath
++      if (rawAir != null) {
++        if (rawAir <= AIR_LOW) bot._pfNeedAir = true
++        else if (rawAir >= AIR_OK) bot._pfNeedAir = false
++      }
++      // backstop: head underwater too long. This always-on time limit is what
++      // GUARANTEES the bot keeps surfacing -- it forces a breath every
++      // SUBMERGE_LIMIT_MS regardless of the (occasionally-stale) air reading,
++      // which also keeps the bot shallow enough that it never settles at a deep
++      // submerged goal where the pathfinder would stop and stop running this
++      // guard. The depth this caps at (~4-5 blocks of open water) is the price
++      // of guaranteed survival; realistic dig-down mining only exposes the bot
++      // to shallow water, so it is unaffected.
++      if (headInWater && bot._pfSubmergedSince != null && (now - bot._pfSubmergedSince) > SUBMERGE_LIMIT_MS) bot._pfNeedAir = true
++      if (!headInWater && rawAir == null) bot._pfNeedAir = false
++
++      // PATCH (skillnet): swim in 3D toward the node. prismarine-physics now
++      // implements sprint-swim (fast movement along the look vector), so instead
++      // of the old yaw-only + jump/sneak crawl, AIM at the target (yaw + pitch)
++      // and sprint-swim. +pitch = up, -pitch = down (verified), so the bot dives
++      // and climbs by looking. Far faster, and the server already accepts it.
++      if (bot._pfNeedAir) {
++        // surface for air FAST: aim straight up and sprint-swim up
++        bot.look(Math.atan2(-dx, -dz), Math.PI / 2, true)
++        bot.setControlState('forward', true)
++        bot.setControlState('jump', true)      // jump-impulse helps break the surface
++        bot.setControlState('sneak', false)
++        bot.setControlState('sprint', true)
++        // The air detour intentionally leaves the path; keep the futility timer
++        // from firing resetPath('stuck') while we breathe.
++        lastNodeTime = performance.now()
++      } else {
++        const groundDist = Math.sqrt(dx * dx + dz * dz)
++        bot.look(Math.atan2(-dx, -dz), Math.atan2(nextPoint.y - p.y, groundDist), true)
++        bot.setControlState('forward', true)
++        bot.setControlState('jump', false)
++        bot.setControlState('sneak', false)
++        bot.setControlState('sprint', true)    // trigger sprint-swim toward the node
++      }
      } else if (stateMovements.allowSprinting && physics.canStraightLine(path, true)) {
        bot.setControlState('jump', false)
+       bot.setControlState('sprint', true)
 diff --git a/node_modules/mineflayer-pathfinder/lib/astar.js b/node_modules/mineflayer-pathfinder/lib/astar.js
 index e7a82cb..2684861
 --- a/node_modules/mineflayer-pathfinder/lib/astar.js
@@ -784,11 +862,60 @@ index 0b8b9de..8e45615
      function goalChangedListener (newGoal) {
        if (newGoal !== goal) {
          cleanup(error('GoalChanged', 'The goal was changed before it could be completed!'))
+diff --git a/node_modules/mineflayer-pathfinder/lib/move.js b/node_modules/mineflayer-pathfinder/lib/move.js
+index 5c4facb..944cd01
+--- a/node_modules/mineflayer-pathfinder/lib/move.js
++++ b/node_modules/mineflayer-pathfinder/lib/move.js
+@@ -10,6 +10,11 @@ class Move extends Vec3 {
+     this.parkour = parkour
+ 
+     this.hash = this.x + ',' + this.y + ',' + this.z
++    // PATCH (skillnet): oxygen-aware planning state -- ticks the bot has been
++    // submerged (without breathing) along the path that reached this node.
++    // Stays 0 on dry land / when air-aware planning is off, so the hash and
++    // search behaviour are unchanged for non-water routes.
++    this.submergedTicks = 0
+   }
+ }
+ 
 diff --git a/node_modules/mineflayer-pathfinder/lib/movements.js b/node_modules/mineflayer-pathfinder/lib/movements.js
-index a7e3505..8baba0d
+index a7e3505..40477dd
 --- a/node_modules/mineflayer-pathfinder/lib/movements.js
 +++ b/node_modules/mineflayer-pathfinder/lib/movements.js
-@@ -55,6 +55,7 @@ class Movements {
+@@ -34,6 +34,32 @@ class Movements {
+     this.allowSprinting = true
+     this.allowEntityDetection = true
+ 
++    // PATCH (skillnet): oxygen-aware planning (pure planning layer). When the bot
++    // is submerged WITHOUT water_breathing, A* prunes any move whose cumulative
++    // submerged time (+ the time to bail back to air, in round-trip mode) would
++    // exceed the usable air budget -- so the planner never routes the bot into a
++    // drowning dig-down/dive. Constants are calibrated on this server (see
++    // scripts/regression_suite/repro_oxygen_planner_digdown.js): air = 300 ticks
++    // (15 s), drains 1/tick; one submerged stone dig with an iron pick ~= 190
++    // ticks (a measured ~10x penalty); submerged swim ~= 3 ticks/block.
++    // No-op on dry land (every node breathes) and when water_breathing is active.
++    this.airAware = true            // master switch
++    this.airReturnReserve = true    // default round-trip: must be able to bail to air; false = one-way
++    this.airUsableTicks = 240       // 300-tick lung minus a 60-tick (3 s) safety margin
++    this.swimTicksPerBlock = 3      // submerged movement (cheap on air)
++    this.submergedDigTicks = 190    // one submerged stone dig (~9.4 s), the real drowning cost
++    this.airReturnScanMax = 24      // how far up to look for breathable air
++    // SOFT cost: the hard prune above only refuses the LETHAL part of a water
++    // route, so the cheapest route can still dive TOWARD the water (A* explores
++    // it first; on a slow server goto walks that partial and the bot dives in
++    // even though airAware is on). Charging each submerged step by the air it
++    // burns (digs heavily, swims lightly) makes the planner globally PREFER a dry
++    // route from the first slice, so the bot heads dry on any server. A flat
++    // per-step entry cost keeps even shallow dives from out-competing a dry
++    // detour on heuristic closeness alone.
++    this.airSubmergedStepCost = 6   // flat cost added per submerged step
++    this.airCostWeight = 0.3        // extra cost per submerged tick (dig = ~190 ticks -> heavy)
++
+     this.entitiesToAvoid = new Set()
+     this.passableEntities = new Set(require('./passableEntities.json'))
+     this.interactableBlocks = new Set(require('./interactable.json'))
+@@ -55,6 +81,7 @@ class Movements {
      this.liquids = new Set()
      this.liquids.add(registry.blocksByName.water.id)
      this.liquids.add(registry.blocksByName.lava.id)
@@ -796,7 +923,7 @@ index a7e3505..8baba0d
  
      this.gravityBlocks = new Set()
      this.gravityBlocks.add(registry.blocksByName.sand.id)
-@@ -255,12 +256,17 @@ class Movements {
+@@ -255,12 +282,17 @@ class Movements {
      }
  
      if (this.dontCreateFlow) {
@@ -820,7 +947,27 @@ index a7e3505..8baba0d
      }
  
      if (this.dontMineUnderFallingBlock) {
-@@ -513,7 +519,13 @@ class Movements {
+@@ -384,8 +416,17 @@ class Movements {
+       cost += this.placeCost // additional cost for placing a block
+     }
+ 
+-    cost += this.safeOrBreak(blockB, toBreak)
+-    if (cost > 100) return
++    // PATCH (skillnet): swimming-pose 1-tall passage. A sprint-swimming bot is
++    // only 0.6 tall, so a horizontal move INTO a water block needs only the feet
++    // block (blockC) clear -- the head block above (blockB) may be solid (a
++    // 1-tall underwater gap). Without this the planner tries to BREAK the ceiling
++    // of every 1-tall water passage and the bot stalls at it. Require head
++    // clearance only when the destination is NOT swim-through water.
++    const swimThrough = blockC.liquid && blockC.type !== this.lavaId
++    if (!swimThrough) {
++      cost += this.safeOrBreak(blockB, toBreak)
++      if (cost > 100) return
++    }
+ 
+     // Open fence gates
+     if (this.canOpenDoors && blockC.openable && blockC.shapes && blockC.shapes.length !== 0) {
+@@ -513,7 +554,13 @@ class Movements {
      cost += this.safeOrBreak(block0, toBreak)
      if (cost > 100) return
  
@@ -835,3 +982,114 @@ index a7e3505..8baba0d
  
      cost += this.getNumEntitiesAt(blockLand.position, 0, 0, 0) * this.entityCost // add cost for entities
  
+@@ -522,7 +569,21 @@ class Movements {
+ 
+   getMoveUp (node, neighbors) {
+     const block1 = this.getBlock(node, 0, 0, 0)
+-    if (block1.liquid) return
++    if (block1.liquid) {
++      // PATCH (skillnet): swim straight up through water. If the bot is in water
++      // and the block above is also water, it can sprint-swim up into it (0.6
++      // hitbox, no jump/place, no head clearance -- a 1-tall water hole in the
++      // ceiling is fine). Without this the planner can NEVER route an upward
++      // water path (e.g. up through a 1-block hole into a chamber above); the
++      // original code refused every up-move from a water block.
++      if (block1.type !== this.lavaId) {
++        const up = this.getBlock(node, 0, 1, 0)
++        if (up.liquid && up.type !== this.lavaId) {
++          neighbors.push(new Move(node.x, node.y + 1, node.z, node.remainingBlocks, 1 + this.liquidCost, [], []))
++        }
++      }
++      return
++    }
+     if (this.getNumEntitiesAt(node, 0, 0, 0) > 0) return // an entity (besides the player) is blocking the building area
+ 
+     const block2 = this.getBlock(node, 0, 2, 0)
+@@ -656,8 +717,87 @@ class Movements {
+     this.getMoveDown(node, neighbors)
+     this.getMoveUp(node, neighbors)
+ 
++    // PATCH (skillnet): oxygen-aware pruning. Only kicks in when the bot is
++    // actually at risk -- submerged without water_breathing. Otherwise the raw
++    // neighbour list is returned unchanged (true no-op on dry land / with WB).
++    if (this.airAware && !this.hasWaterBreathing()) return this.airFilter(node, neighbors)
+     return neighbors
+   }
++
++  // PATCH (skillnet): true if the bot currently breathes underwater for free
++  // (Water Breathing or Conduit Power). The registry names effects in PascalCase
++  // (WaterBreathing / ConduitPower), so resolve the ids by a tolerant name match
++  // once and cache them.
++  hasWaterBreathing () {
++    const e = this.bot.entity
++    const eff = e && e.effects
++    if (!eff) return false
++    if (this._airBreathEffectIds === undefined) {
++      this._airBreathEffectIds = []
++      const reg = this.bot.registry
++      const arr = reg && (reg.effectsArray || (reg.effects && Object.values(reg.effects)))
++      if (arr) for (const ef of arr) { if (/water.?breathing|conduit.?power/i.test(ef.name || '')) this._airBreathEffectIds.push(ef.id) }
++    }
++    return this._airBreathEffectIds.some((id) => eff[id])
++  }
++
++  // PATCH (skillnet): does a node "breathe"? We must answer for the POST-dig
++  // world, not the static one: a dig-down node has un-dug stone directly above
++  // it now, but once dug the shaft floods from any water body overhead. So scan
++  // straight up, treating diggable solids as "will be dug": the node is SUBMERGED
++  // iff the first non-solid cell found is water (a water table sits above it);
++  // it BREATHES if the first non-solid cell is air (or none within range) -- which
++  // also leaves ordinary DRY mining (no water overhead) completely unpenalized.
++  breathingAt (node) {
++    for (let dy = 1; dy <= this.airReturnScanMax; dy++) {
++      const b = this.getBlock(node, 0, dy, 0)
++      if (!b) return true                  // outside loaded world -> assume air
++      if (b.name === 'water') return false // water table overhead -> floods -> submerged
++      if (!b.physical) return true          // open air reached first -> breathing
++      // solid & diggable -> part of the shaft the bot digs through; keep rising
++    }
++    return true                            // no water overhead within range -> safe
++  }
++
++  // PATCH (skillnet): ticks to bail back up to breathable air from a submerged
++  // node. The bot surfaces by swimming straight UP through water; it cannot rise
++  // through solid rock. So count the vertical water distance to the first air
++  // cell; a solid cell overhead means there is no straight-up escape from here
++  // (Infinity => a drown trap, pruned). This is the round-trip safety guarantee.
++  returnReserveTicks (node) {
++    for (let dy = 1; dy <= this.airReturnScanMax; dy++) {
++      const b = this.getBlock(node, 0, dy, 0)
++      if (!b) return dy * this.swimTicksPerBlock          // outside world -> assume open air
++      if (b.name === 'water') continue                    // swim up through water
++      if (!b.physical) return dy * this.swimTicksPerBlock // reached breathable air
++      return Infinity                                     // solid overhead: no straight-up surface
++    }
++    return Infinity
++  }
++
++  // PATCH (skillnet): air-budget filter. Propagates submergedTicks parent->child;
++  // breathing nodes reset it; submerged nodes add swim + (10x) dig time and are
++  // pruned if cumulative submersion (+ the bail-to-air reserve, in round-trip
++  // mode) would exceed the usable air budget. The air bucket is appended to the
++  // node hash so the same cell reached with more air is explored separately.
++  airFilter (parent, neighbors) {
++    const parentSub = parent.submergedTicks || 0
++    const out = []
++    for (const n of neighbors) {
++      if (this.breathingAt(n)) { n.submergedTicks = 0; out.push(n); continue }
++      const digTicks = (n.toBreak ? n.toBreak.length : 0) * this.submergedDigTicks
++      const sub = parentSub + this.swimTicksPerBlock + digTicks
++      const reserve = this.airReturnReserve ? this.returnReserveTicks(n) : 0
++      if (sub + reserve > this.airUsableTicks) continue // would drown / cannot return -> prune
++      // soft cost: prefer breathing/dry routes (this step's air burn), so the
++      // committed/partial path heads dry instead of diving toward the cheap water.
++      n.cost += this.airSubmergedStepCost + (this.swimTicksPerBlock + digTicks) * this.airCostWeight
++      n.submergedTicks = sub
++      n.hash = n.hash + ':' + Math.floor(sub / 60)
++      out.push(n)
++    }
++    return out
++  }
+ }
+ 
+ module.exports = Movements
