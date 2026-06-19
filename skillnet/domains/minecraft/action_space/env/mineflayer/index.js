@@ -1779,6 +1779,28 @@ app.post("/step", async (req, res) => {
             return err;
         }
         console.log(stack);
+        // Skill-level localization: the V8 stack names the skill function that
+        // threw (anonymous reduce/map callbacks are skipped). Surfacing it lets
+        // the optimizer's credit-assignment target the actual buggy skill instead
+        // of guessing from the call chain (which can misattribute the failure to a
+        // correct sibling and never touch the real culprit). Best-effort: never
+        // let localization break error reporting.
+        // buggySkill is the nearest REGISTERED skill (a real candidate the
+        // optimizer can route feedback to); buggyInline is the deeper inline
+        // helper that actually threw, when it is not itself a registered skill
+        // (so the optimizer/LLM knows which inline function inside buggySkill to
+        // fix instead of mis-blaming the skill's own correct code).
+        let buggySkill = null;
+        let buggyInline = null;
+        try {
+            const { localizeSkillChain } = require("./_psn_skill_localize");
+            const _names = (typeof skillNames !== "undefined" && Array.isArray(skillNames)) ? skillNames : [];
+            const loc = localizeSkillChain(stack, _names);
+            if (loc) {
+                buggySkill = loc.registeredAncestor || loc.culprit;
+                if (loc.culprit && loc.culprit !== buggySkill) buggyInline = loc.culprit;
+            }
+        } catch (e) { /* non-fatal */ }
         const final_line = stack.split("\n")[1];
         const regex = /<anonymous>:(\d+):\d+\)/;
 
@@ -1859,7 +1881,10 @@ app.post("/step", async (req, res) => {
             let source;
             if (firstFrameInfo.section === "programs") {
                 const progLine = safeGetLine(programLines, firstFrameInfo.sourceLine);
-                source = `In your program code: ${progLine || "(line not available)"} (programs line ${firstFrameInfo.sourceLine})\n`;
+                const skillPrefix = buggySkill
+                    ? `In skill '${buggySkill}'${buggyInline ? ` (inline function '${buggyInline}')` : ""} -- `
+                    : "";
+                source = `${skillPrefix}In your program code: ${progLine || "(line not available)"} (programs line ${firstFrameInfo.sourceLine})\n`;
             } else if (firstFrameInfo.section === "code") {
                 const codeLine = safeGetLine(codeLines, firstFrameInfo.sourceLine);
                 source = `In your code: ${codeLine || "(line not available)"} (code line ${firstFrameInfo.sourceLine})\n`;
