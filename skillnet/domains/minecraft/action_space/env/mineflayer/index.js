@@ -623,6 +623,22 @@ app.post("/step", async (req, res) => {
     }
     // import useful package
     let response_sent = false;
+    // Move recorded skill-execution events into the observation BEFORE any
+    // response is sent. The happy path does this inline near the end of the
+    // step; every error/abort path that can short-circuit (uncaughtException,
+    // observe-on-error) must do it too, otherwise the error surfaces (onError is
+    // preserved) but the entire actual-execution sub-graph (skillStart/skillEnd/
+    // skillError + callStack edges) is silently dropped, leaving the optimizer's
+    // credit assignment with no candidate sub-graph. Idempotent: clears the
+    // buffer after flushing so a later happy-path flush does not duplicate.
+    function flushSkillExecutions() {
+        if (bot && bot.cumulativeObs && bot.skillExecutions && bot.skillExecutions.length > 0) {
+            for (const exec of bot.skillExecutions) {
+                bot.cumulativeObs.push([exec.type, exec]);
+            }
+            bot.skillExecutions = [];
+        }
+    }
     function otherError(err) {
         // PATCH (skillnet): this can fire from a stale listener after the bot
         // was torn down; dereferencing a null bot here would throw INSIDE an
@@ -642,6 +658,7 @@ app.post("/step", async (req, res) => {
             if (!response_sent) {
                 response_sent = true;
                 try {
+                    flushSkillExecutions();
                     const obsResult = bot.observe();
                     safeJsonResponse(res, obsResult);
                 } catch (obsErr) {
@@ -1076,12 +1093,7 @@ app.post("/step", async (req, res) => {
         }
         
         // Append skill-execution events to cumulativeObs
-        if (bot.skillExecutions && bot.skillExecutions.length > 0) {
-            for (const exec of bot.skillExecutions) {
-                bot.cumulativeObs.push([exec.type, exec]);
-            }
-            bot.skillExecutions = []; // clear to avoid duplicates
-        }
+        flushSkillExecutions();
 
         // Inject placed_blocks evidence from returnItems()
         if (bot.placedBlocksThisStep && bot.placedBlocksThisStep.length > 0) {
@@ -1116,6 +1128,7 @@ app.post("/step", async (req, res) => {
         if (!response_sent) {
             response_sent = true;
             try {
+                flushSkillExecutions();
                 const obsResult = bot.observe();
                 safeJsonResponse(res, obsResult);
             } catch (responseErr) {
