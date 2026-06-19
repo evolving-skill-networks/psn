@@ -364,6 +364,448 @@ def extract_all_function_definitions(code: str) -> List[Dict[str, str]]:
     return definitions
 
 
+def _blank_noncode(code: str) -> str:
+    """Return a same-length copy of `code` with the *contents* of string
+    literals and comments replaced by spaces, so brace/identifier scanning is
+    not fooled by braces or words inside strings/comments. Code inside template
+    `${ ... }` interpolations is KEPT (it is real code that may reference free
+    variables); the surrounding template text is blanked.
+    """
+    out = list(code)
+    n = len(code)
+    i = 0
+    state = None  # None | "'" | '"' | '`' | '//' | '/*'
+    while i < n:
+        c = code[i]
+        if state is None:
+            if c in ("'", '"', '`'):
+                state = c
+            elif c == '/' and i + 1 < n and code[i + 1] == '/':
+                state = '//'; out[i] = ' '
+            elif c == '/' and i + 1 < n and code[i + 1] == '*':
+                state = '/*'; out[i] = ' '
+            i += 1
+        elif state in ("'", '"'):
+            if c == '\\':
+                out[i] = ' '
+                if i + 1 < n:
+                    out[i + 1] = ' '
+                i += 2
+                continue
+            if c == state:
+                state = None
+            else:
+                out[i] = ' '
+            i += 1
+        elif state == '`':
+            if c == '\\':
+                out[i] = ' '
+                if i + 1 < n:
+                    out[i + 1] = ' '
+                i += 2
+                continue
+            if c == '`':
+                state = None
+                i += 1
+                continue
+            if c == '$' and i + 1 < n and code[i + 1] == '{':
+                # keep the interpolated expression as code; skip to matching }
+                depth = 1
+                j = i + 2
+                while j < n and depth > 0:
+                    if code[j] == '{':
+                        depth += 1
+                    elif code[j] == '}':
+                        depth -= 1
+                    j += 1
+                i = j
+                continue
+            out[i] = ' '
+            i += 1
+        elif state == '//':
+            if c == '\n':
+                state = None
+            else:
+                out[i] = ' '
+            i += 1
+        elif state == '/*':
+            if c == '*' and i + 1 < n and code[i + 1] == '/':
+                out[i] = ' '; out[i + 1] = ' '
+                state = None
+                i += 2
+                continue
+            if c != '\n':
+                out[i] = ' '
+            i += 1
+    return ''.join(out)
+
+
+def _balanced_block_end(blanked: str, open_brace_idx: int) -> int:
+    """Given the index of an opening '{', return the index just AFTER its
+    matching '}' (brace-balanced over the blanked source). -1 if unbalanced."""
+    depth = 0
+    i = open_brace_idx
+    n = len(blanked)
+    while i < n:
+        ch = blanked[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+# Reserved words / literals that must never be treated as free variables.
+_JS_RESERVED = {
+    'true', 'false', 'null', 'undefined', 'this', 'super', 'arguments',
+    'let', 'const', 'var', 'else', 'do', 'of', 'in', 'case', 'default',
+    'break', 'continue', 'yield', 'try', 'finally', 'class', 'extends',
+    'export', 'import', 'from', 'as', 'static', 'get', 'set',
+}
+
+
+def _split_param_names(param_str: str) -> set:
+    """Extract bound names from a JS parameter list, handling defaults and
+    simple object/array destructuring: `(a, b = 1, {x, y}, [z])` -> {a,b,x,y,z}."""
+    names = set()
+    for tok in re.findall(r'[A-Za-z_$][\w$]*', param_str or ''):
+        names.add(tok)
+    # drop obvious default-value identifiers? keep conservative: destructured /
+    # default RHS identifiers being marked "bound" only ever REMOVES a name from
+    # free vars, which is safe (won't cause a false closure-capture skip here).
+    return names
+
+
+def _find_function_defs(code: str):
+    """Locate every function/arrow definition in `code` with span + metadata.
+
+    Returns a list of dicts: {name, kind, is_async, params, def_start,
+    body_start, body_end} where kind is 'decl' | 'funcexpr' | 'arrow_block' |
+    'arrow_expr'. body_start..body_end is the source slice of the body
+    (including braces for blocks; the bare expression for arrow_expr).
+    """
+    blanked = _blank_noncode(code)
+    defs = []
+    seen_spans = set()
+
+    def add(name, kind, is_async, params, def_start, body_start, body_end):
+        key = (def_start, body_end)
+        if body_end <= body_start or key in seen_spans:
+            return
+        seen_spans.add(key)
+        defs.append({
+            "name": name, "kind": kind, "is_async": is_async, "params": params,
+            "def_start": def_start, "body_start": body_start, "body_end": body_end,
+        })
+
+    # 1) function declarations:  [async] function NAME(params) { ... }
+    for m in re.finditer(r'(\basync\s+)?\bfunction\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{', blanked):
+        body_start = blanked.index('{', m.end() - 1)
+        end = _balanced_block_end(blanked, body_start)
+        if end != -1:
+            add(m.group(2), 'decl', bool(m.group(1)), m.group(3), m.start(), body_start, end)
+
+    # 2) named function expressions:  const|let|var NAME = [async] function(params) { ... }
+    for m in re.finditer(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s+)?function\s*\(([^)]*)\)\s*\{', blanked):
+        body_start = blanked.index('{', m.end() - 1)
+        end = _balanced_block_end(blanked, body_start)
+        if end != -1:
+            add(m.group(1), 'funcexpr', bool(m.group(2)), m.group(3), m.start(), body_start, end)
+
+    # 3) arrow functions:  const|let|var NAME = [async] (params) => ...   or   x => ...
+    for m in re.finditer(
+        r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(async\s+)?'
+        r'(?:\(([^)]*)\)|([A-Za-z_$][\w$]*))\s*=>\s*', blanked):
+        name = m.group(1)
+        is_async = bool(m.group(2))
+        params = m.group(3) if m.group(3) is not None else (m.group(4) or '')
+        after = m.end()
+        if after < len(blanked) and blanked[after] == '{':
+            end = _balanced_block_end(blanked, after)
+            if end != -1:
+                add(name, 'arrow_block', is_async, params, m.start(), after, end)
+        else:
+            # expression body: scan to a top-level ';' (or end), tracking nesting
+            depth = 0
+            j = after
+            end = -1
+            while j < len(blanked):
+                ch = blanked[j]
+                if ch in '([{':
+                    depth += 1
+                elif ch in ')]}':
+                    if depth == 0:
+                        end = j
+                        break
+                    depth -= 1
+                elif ch == ';' and depth == 0:
+                    end = j
+                    break
+                j += 1
+            if end == -1:
+                end = len(blanked)
+            add(name, 'arrow_expr', is_async, params, m.start(), after, end)
+
+    return defs
+
+
+def _bound_names_in(blanked_region: str) -> set:
+    """All identifiers BOUND inside a code region: params of any nested
+    function/arrow, and var/let/const declarations (incl. simple destructuring),
+    plus nested function declaration names."""
+    bound = set()
+    for m in re.finditer(r'\bfunction\s*([A-Za-z_$][\w$]*)?\s*\(([^)]*)\)', blanked_region):
+        if m.group(1):
+            bound.add(m.group(1))
+        bound |= _split_param_names(m.group(2))
+    for m in re.finditer(r'\(([^)]*)\)\s*=>', blanked_region):
+        bound |= _split_param_names(m.group(1))
+    for m in re.finditer(r'(?<![.\w$])([A-Za-z_$][\w$]*)\s*=>', blanked_region):
+        bound.add(m.group(1))
+    for m in re.finditer(r'\b(?:var|let|const)\s+(\{[^}]*\}|\[[^\]]*\]|[A-Za-z_$][\w$]*)', blanked_region):
+        bound |= _split_param_names(m.group(1))
+    return bound
+
+
+def _referenced_idents(blanked_region: str) -> set:
+    """Identifiers referenced as values (not property accesses) in a region."""
+    return set(re.findall(r'(?<![.\w$])([A-Za-z_$][\w$]*)', blanked_region))
+
+
+def _enclosing_scope_bindings(blanked: str, defs: list, ancestor: dict) -> set:
+    """Identifiers bound DIRECTLY in ``ancestor``'s own function scope: its
+    params, the var/let/const it declares (at any block depth but NOT inside a
+    nested function), and the names of functions it directly declares. The
+    params/locals of NESTED functions (e.g. a sibling helper's parameters) are
+    deliberately EXCLUDED -- they are not in scope for another nested helper, so
+    counting them would wrongly flag a free variable as a closure capture when an
+    undefined-variable typo happens to share a name with an unrelated sibling
+    param."""
+    binds = set(_split_param_names(ancestor["params"]))
+    a_s, a_e = ancestor["body_start"], ancestor["body_end"]
+    region = list(blanked[a_s:a_e])
+    for f in defs:
+        if f is ancestor:
+            continue
+        if not (a_s < f["def_start"] and f["body_end"] <= a_e):
+            continue
+        # immediate parent of f = the deepest def that contains it
+        parents = [g for g in defs if g is not f
+                   and g["body_start"] < f["def_start"] and f["body_end"] <= g["body_end"]]
+        immediate = max(parents, key=lambda g: g["body_start"]) if parents else None
+        if immediate is ancestor:
+            binds.add(f["name"])  # a function declared directly in ancestor's scope
+            # blank f's whole span so its params/locals do not leak into ancestor scope
+            for i in range(f["def_start"] - a_s, f["body_end"] - a_s):
+                region[i] = ' '
+    region_str = ''.join(region)
+    for m in re.finditer(r'\b(?:var|let|const)\s+(\{[^}]*\}|\[[^\]]*\]|[A-Za-z_$][\w$]*)', region_str):
+        binds |= _split_param_names(m.group(1))
+    return binds
+
+
+def extract_self_contained_helpers(code: str) -> List[Dict[str, Any]]:
+    """Detect helper functions that the top-level-async path
+    (`extract_all_function_definitions`) MISSES -- nested (any), top-level sync
+    declarations, named function expressions, and arrow functions -- and
+    classify each as self-contained (hoistable to a standalone async skill node)
+    or not.
+
+    A helper is NOT extractable iff it references a free variable that is bound
+    in an ENCLOSING FUNCTION scope (a real closure capture): hoisting it would
+    produce a broken `X is not defined` node. A free variable bound in NO
+    enclosing scope (an undefined-variable typo) is still extractable: extraction
+    preserves the bug for the optimizer to find and fix on the now-isolated skill
+    instead of mis-blaming the caller. `bot`/`mcData`/`Vec3` are re-injectable and
+    never count as blocking captures.
+
+    Returns a list of dicts:
+      name, form, raw_code, standalone_code (None if not extractable),
+      params, takes_bot, needs_bot_injection, extractable, skip_reason,
+      free_vars, closure_captures
+    """
+    if not code or not isinstance(code, str):
+        return []
+
+    blanked = _blank_noncode(code)
+    defs = _find_function_defs(code)
+
+    results = []
+    for d in defs:
+        # ancestors: function defs whose body strictly contains this def
+        ancestors = [
+            a for a in defs
+            if a is not d and a["body_start"] < d["def_start"] and d["body_end"] <= a["body_end"]
+        ]
+        is_top_level = len(ancestors) == 0
+
+        # SKIP forms already handled by extract_all_function_definitions:
+        # top-level `async function NAME` declarations.
+        if is_top_level and d["kind"] == "decl" and d["is_async"]:
+            continue
+        # Never treat a non-async TOP-LEVEL sibling that is actually the "main"
+        # is impossible to know here; we surface all candidates and let the
+        # caller decide. (A top-level sync decl that is the task wrapper is async
+        # in practice, so it is excluded above.)
+
+        body_blanked = blanked[d["body_start"]:d["body_end"]]
+        body_raw = code[d["def_start"]:d["body_end"]]
+
+        own_params = _split_param_names(d["params"])
+        bound_in = own_params | _bound_names_in(body_blanked) | {d["name"]}
+        refs = _referenced_idents(body_blanked)
+        free = {r for r in refs if r not in bound_in and r not in JS_BUILTINS and r not in _JS_RESERVED}
+
+        # enclosing-function scope bindings (the only thing that blocks hoisting):
+        # each ancestor's OWN params + direct locals + direct child-function names,
+        # NOT the params/locals of sibling nested functions.
+        ancestor_locals = set()
+        for a in ancestors:
+            ancestor_locals |= _enclosing_scope_bindings(blanked, defs, a)
+
+        reinjectable = {'bot', 'mcData', 'Vec3'}
+        closure_captures = sorted((free & ancestor_locals) - reinjectable)
+        takes_bot = bool(own_params) and list_first_is_bot(d["params"])
+        # `bot` is a JS_BUILTINS entry so it is filtered out of `free`; check the
+        # raw refs instead so a helper that uses bot from closure (no bot param)
+        # is flagged for bot-injection when hoisted to a standalone skill.
+        needs_bot_injection = ('bot' in refs) and not takes_bot
+        extractable = len(closure_captures) == 0
+
+        form = {
+            'decl': 'nested' if not is_top_level else 'toplevel_sync',
+            'funcexpr': 'funcexpr',
+            'arrow_block': 'arrow',
+            'arrow_expr': 'arrow',
+        }[d["kind"]]
+        if not is_top_level:
+            form = 'nested'
+
+        standalone_code = None
+        if extractable:
+            params = d["params"].strip()
+            if needs_bot_injection:
+                params = 'bot' if not params else 'bot, ' + params
+            if d["kind"] == 'arrow_expr':
+                expr = code[d["body_start"]:d["body_end"]].strip()
+                standalone_code = f"async function {d['name']}({params}) {{\n  return {expr};\n}}"
+            else:
+                block = code[d["body_start"]:d["body_end"]]
+                standalone_code = f"async function {d['name']}({params}) {block}"
+
+        results.append({
+            "name": d["name"],
+            "form": form,
+            "raw_code": body_raw,
+            "standalone_code": standalone_code,
+            "params": d["params"].strip(),
+            "takes_bot": takes_bot,
+            "needs_bot_injection": needs_bot_injection,
+            "extractable": extractable,
+            "skip_reason": (None if extractable
+                            else f"captures enclosing var(s): {closure_captures}"),
+            "free_vars": sorted(free),
+            "closure_captures": closure_captures,
+            "is_top_level": is_top_level,
+        })
+
+    return results
+
+
+def remove_inline_function_def(code: str, name: str):
+    """Strip an inline ``[async] function name(...) { ... }`` declaration (and its
+    brace-balanced body) from ``code``. Returns ``(new_code, removed)``.
+    ``removed`` is False (and code unchanged) if the declaration is not found or
+    its braces are unbalanced (never risk a corrupt edit)."""
+    blanked = _blank_noncode(code)
+    pat = re.compile(rf'(?:\basync\s+)?\bfunction\s+{re.escape(name)}\s*\([^)]*\)\s*\{{')
+    m = pat.search(blanked)
+    if not m:
+        return code, False
+    start = m.start()
+    body_open = blanked.index('{', m.end() - 1)
+    end = _balanced_block_end(blanked, body_open)
+    if end == -1:
+        return code, False
+    updated = code[:start] + code[end:]
+    updated = re.sub(r'\n{3,}', '\n\n', updated)
+    return updated, True
+
+
+def rewrite_calls_await(code: str, name: str, inject_bot: bool):
+    """Rewrite bare ``name(args)`` call sites to ``await name(bot, args)`` (when
+    ``inject_bot``) or ``await name(args)`` (when the helper already takes bot).
+    Property calls (``.name(``) and already-``await``ed calls are left untouched.
+    Returns ``(new_code, ok)``; ok=False on a malformed/unbalanced call so the
+    caller rejects the whole migration rather than risk a bad edit."""
+    blanked = _blank_noncode(code)
+    pat = re.compile(r'(?<![.\w$])' + re.escape(name) + r'\s*\(')
+    out = []
+    last = 0
+    for m in pat.finditer(blanked):
+        open_idx = m.end() - 1
+        depth = 0
+        j = open_idx
+        while j < len(blanked):
+            ch = blanked[j]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            return code, False  # unbalanced -> reject migration
+        close_idx = j
+        already_awaited = code[:m.start()].rstrip().endswith('await')
+        out.append(code[last:m.start()])
+        if already_awaited:
+            out.append(code[m.start():close_idx + 1])
+        else:
+            args = code[open_idx + 1:close_idx].strip()
+            if inject_bot:
+                new_args = 'bot' if args == '' else 'bot, ' + args
+            else:
+                new_args = args
+            out.append(f"await {name}({new_args})")
+        last = close_idx + 1
+    out.append(code[last:])
+    return ''.join(out), True
+
+
+def migrate_parent_extract_helper(parent_code: str, name: str, inject_bot: bool):
+    """Make ``parent_code`` safe after extracting helper ``name`` to a standalone
+    skill: remove its inline definition AND rewrite its call sites to the
+    async/bot contract. Returns ``(new_code, ok)``. ``ok=False`` leaves the parent
+    unchanged (caller must skip the extraction). Does NOT validate JS syntax --
+    the caller verifies with the real parser (all-or-nothing)."""
+    without_def, removed = remove_inline_function_def(parent_code, name)
+    if not removed:
+        return parent_code, False
+    migrated, ok = rewrite_calls_await(without_def, name, inject_bot)
+    if not ok:
+        return parent_code, False
+    # completeness: no old-contract (non-awaited) bare call may remain
+    blanked = _blank_noncode(migrated)
+    for m in re.finditer(r'(?<![.\w$])' + re.escape(name) + r'\s*\(', blanked):
+        if not migrated[:m.start()].rstrip().endswith('await'):
+            return parent_code, False
+    return migrated, True
+
+
+def list_first_is_bot(param_str: str) -> bool:
+    """True iff the first declared parameter is literally `bot`."""
+    parts = [p.strip() for p in (param_str or '').split(',') if p.strip()]
+    if not parts:
+        return False
+    first = re.match(r'[A-Za-z_$][\w$]*', parts[0])
+    return bool(first) and first.group(0) == 'bot'
+
+
 def serialize_effects(effects: List["SkillEffect"]) -> List[Dict[str, Any]]:
     """
     Serialize a list of SkillEffect into a JSON-friendly form.

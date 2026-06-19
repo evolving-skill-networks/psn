@@ -14,7 +14,11 @@ from skillnet._psn_impl.event_helpers import (
 )
 from skillnet._psn_impl.step_context import StepContext
 from skillnet.core.dk_registry import get_domain_knowledge
-from skillnet.agents.skill_graph.utils.code_analysis import validate_code_completeness
+from skillnet.agents.skill_graph.utils.code_analysis import (
+    validate_code_completeness,
+    extract_self_contained_helpers,
+    migrate_parent_extract_helper,
+)
 from skillnet.agents.skill_graph.utils.code_validation import get_control_primitives
 from skillnet.agents.skill_graph.utils.async_await_validation import (
     detect_concurrency_risk,
@@ -29,6 +33,17 @@ class StepExecutePhaseMixin:
     def _step_execute(self, ctx: StepContext):
         """Phase 4: build code, validate, execute env.step, critic evaluation."""
         ctx.code = ctx.parsed_result["program_code"] + "\n" + ctx.parsed_result["exec_code"]
+
+        # Register-at-birth: extract self-contained helper functions defined
+        # inline in the generated code into standalone experimental skill nodes,
+        # and migrate the code to call them. This makes a helper that ran but was
+        # not its own node (e.g. an inline counter carrying a bug) first-class: a
+        # graph node (candidate-eligible for the optimizer) AND wrapped (emits
+        # skillStart, so it appears in the actual-execution sub-graph). Closure-
+        # capturing helpers are left inline (cannot stand alone). Runs BEFORE
+        # skill_names is computed so the extracted helpers flow into wrapping and
+        # the candidate set with no other change. Mutates ctx.code in place.
+        self._register_self_contained_helpers(ctx)
 
         # Extract the skill-name list: only wrap skills actually needed in the
         # call chain (not all skills in the graph), to avoid evaluating large
@@ -195,6 +210,73 @@ class StepExecutePhaseMixin:
             print(f"\033[35m[Critic Quality] robustness={ctx.quality_metrics.get('robustness_score', 'N/A')}, "
                   f"dependency_safety={ctx.quality_metrics.get('dependency_safety', 'N/A')}, "
                   f"environment_awareness={ctx.quality_metrics.get('environment_awareness', 'N/A')}\033[0m")
+
+    def _register_self_contained_helpers(self, ctx: StepContext):
+        """Register-at-birth. See call site in _step_execute for rationale.
+
+        For each extractable self-contained helper defined inline in ctx.code:
+          1. migrate ctx.code (remove the inline def + rewrite calls to the
+             async/bot contract) -- all-or-nothing, verified by the JS parser;
+          2. register the helper's standalone code as an experimental node
+             (lightweight pre_register_skill).
+        Skips closure-capturing helpers, existing nodes, and any helper whose
+        parent migration does not re-parse cleanly (the parent is left untouched
+        for that helper, so this never breaks the running code).
+        """
+        try:
+            helpers = extract_self_contained_helpers(ctx.code)
+        except Exception as e:
+            print(f"\033[33m[Register-at-birth] helper detection failed: {e}\033[0m")
+            return
+        extractable = [h for h in helpers if h.get("extractable") and h.get("standalone_code")]
+        if not extractable:
+            return
+
+        dk = get_domain_knowledge()
+        skill_lang = dk.get_skill_language_impl() if dk else None
+        registered = []
+
+        for h in extractable:
+            name = h["name"]
+            # Do not clobber an existing graph node / already-registered helper.
+            if self.skill_manager.has_node(name):
+                continue
+            # Migrate the parent: remove inline def + rewrite call sites.
+            migrated, ok = migrate_parent_extract_helper(
+                ctx.code, name, h["needs_bot_injection"]
+            )
+            if not ok:
+                continue
+            # All-or-nothing: the migrated code must still parse, else leave inline.
+            if skill_lang is not None:
+                try:
+                    res = skill_lang.validate_syntax(migrated)
+                    if not getattr(res, "valid", False):
+                        continue
+                except Exception:
+                    continue
+            # Register the helper as an experimental node (no LLM, no checkpoint).
+            try:
+                final_name, _code = self.skill_manager.pre_register_skill(
+                    name=name, code=h["standalone_code"], task=self.task
+                )
+            except Exception as e:
+                print(f"\033[33m[Register-at-birth] pre_register failed for '{name}': {e}\033[0m")
+                continue
+            # If pre_register renamed (e.g. primitive-name conflict), rewrite the
+            # migrated code's calls to the final name so they still resolve.
+            if final_name and final_name != name:
+                migrated = re.sub(
+                    rf'\b{re.escape(name)}\s*\(', f"{final_name}(", migrated
+                )
+            ctx.code = migrated
+            registered.append(final_name or name)
+
+        if registered:
+            print(
+                f"\033[36m[Register-at-birth] extracted self-contained "
+                f"helper(s) -> {', '.join(registered)}\033[0m"
+            )
 
     def _step_diagnose_and_record(self, ctx: StepContext):
         """Phase 5: Graph planner failure diagnostics + trajectory update + skill recording."""
