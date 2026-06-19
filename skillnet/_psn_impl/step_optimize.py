@@ -4,6 +4,7 @@ StepOptimizeMixin: Phase 6 of step() pipeline.
 Two-phase skill optimization on task failure.
 """
 
+import re
 import traceback
 
 from skillnet._psn_impl.event_helpers import (
@@ -150,6 +151,29 @@ class StepOptimizeMixin:
 
         # [Fix 4] expand the call chain to ensure complete optimization scope
         skills_to_optimize = self.skill_manager.expand_with_dependencies(skills_to_optimize)
+
+        # Also seed candidates from the ACTUAL-execution sub-graph (skills that
+        # really ran, via skillStart events) and the skill the error stack blames,
+        # so the real culprit is optimized even when the static call graph is stale
+        # or degenerate. A self-contained inline helper the stack names but that is
+        # not yet its own node is materialized first so it can be a candidate.
+        rt_nodes, rt_edges, localized_skill, localized_inline = \
+            self._collect_runtime_subgraph_and_culprit(ctx)
+        if localized_inline and not self.skill_manager.has_node(localized_inline):
+            self._materialize_inline_culprit(localized_skill, localized_inline)
+        for cand in [localized_inline, localized_skill, *sorted(rt_nodes)]:
+            if cand and cand not in skills_to_optimize and (
+                self.skill_manager.has_node(cand)
+                or self.skill_manager.is_task_specific_skill_in_storage(cand)):
+                skills_to_optimize.append(cand)
+        # Record actually-observed caller->callee edges so backprop can traverse
+        # the true execution sub-graph (both endpoints must already be nodes).
+        for parent, child in rt_edges:
+            if parent != child and self.skill_manager.has_node(parent) and self.skill_manager.has_node(child):
+                try:
+                    self.skill_manager.add_edge(parent, child)
+                except Exception:
+                    pass
 
         if skills_to_optimize:
             # Extract current state from events
@@ -473,3 +497,87 @@ class StepOptimizeMixin:
             )
         except Exception as e:
             print(f"\033[33m[Synthesis] Helper extraction failed: {e}\033[0m")
+
+    def _collect_runtime_subgraph_and_culprit(self, ctx: StepContext):
+        """Build the actual-execution sub-graph and the error-localized culprit.
+
+        Returns (runtime_nodes, runtime_edges, localized_skill, localized_inline):
+          - runtime_nodes: skills that actually ran (from skillStart events)
+          - runtime_edges: observed (caller, callee) pairs from skillStart callStacks
+          - localized_skill: the registered skill the error stack blames
+          - localized_inline: the inline helper inside it the stack blames, when the
+            error carries the "In skill 'X' (inline function 'Y')" prefix
+        """
+        runtime_nodes = set()
+        runtime_edges = []
+        current_error = None
+        for event_type, event_data in iter_events(ctx.events):
+            if event_type == "skillStart" and isinstance(event_data, dict):
+                name = event_data.get("skillName")
+                if name:
+                    runtime_nodes.add(name)
+                call_stack = event_data.get("callStack")
+                if isinstance(call_stack, list) and len(call_stack) >= 2:
+                    runtime_edges.append((call_stack[-2], call_stack[-1]))
+            elif event_type == "onError" and current_error is None:
+                current_error = event_data.get("onError") if isinstance(event_data, dict) else str(event_data)
+            elif event_type == "error" and current_error is None:
+                current_error = str(event_data.get("error", "")) if isinstance(event_data, dict) else str(event_data)
+
+        localized_skill = None
+        localized_inline = None
+        if current_error:
+            m = re.search(r"In skill '([^']+)'(?:\s*\(inline function '([^']+)'\))?", current_error)
+            if m:
+                localized_skill = m.group(1)
+                localized_inline = m.group(2)
+        return runtime_nodes, runtime_edges, localized_skill, localized_inline
+
+    def _materialize_inline_culprit(self, ancestor: str, inline: str):
+        """Retroactively extract a self-contained inline helper named by the error
+        stack from its containing skill into its own experimental node, so it can be
+        optimized as a first-class candidate (the same transformation register-at-
+        birth applies to freshly authored code, applied here to an existing node).
+        All-or-nothing: self-contained helpers only, parser-verified migration;
+        otherwise the ancestor is left untouched.
+        """
+        if not ancestor or not inline or not self.skill_manager.has_node(ancestor):
+            return
+        try:
+            from skillnet.core.dk_registry import get_domain_knowledge
+            from skillnet.agents.skill_graph.utils.code_analysis import (
+                extract_self_contained_helpers,
+                migrate_parent_extract_helper,
+            )
+            node = self.skill_manager.get_node(ancestor)
+            code = node.code if node else None
+            if not code:
+                return
+            helper = next(
+                (h for h in extract_self_contained_helpers(code)
+                 if h.get("name") == inline and h.get("extractable") and h.get("standalone_code")),
+                None,
+            )
+            if not helper:
+                return
+            migrated, ok = migrate_parent_extract_helper(code, inline, helper["needs_bot_injection"])
+            if not ok:
+                return
+            dk = get_domain_knowledge()
+            skill_lang = dk.get_skill_language_impl() if dk else None
+            if skill_lang is not None:
+                res = skill_lang.validate_syntax(migrated)
+                if not getattr(res, "valid", False):
+                    return
+            final_name, _code = self.skill_manager.pre_register_skill(
+                name=inline, code=helper["standalone_code"], task=self.task
+            )
+            if final_name and final_name != inline:
+                migrated = re.sub(rf'\b{re.escape(inline)}\s*\(', f"{final_name}(", migrated)
+            # Update the ancestor to call the extracted skill. pre_register_skill is
+            # the light path (no LLM description regeneration, tolerant of an LLM
+            # outage) and rebuilds the ancestor->culprit edge from the migrated code.
+            self.skill_manager.pre_register_skill(name=ancestor, code=migrated, task=self.task)
+            print(f"\033[36m[Candidate] materialized inline culprit '{final_name or inline}' from '{ancestor}'\033[0m")
+        except Exception as e:
+            print(f"\033[33m[Candidate] materialize inline culprit failed: {e}\033[0m")
