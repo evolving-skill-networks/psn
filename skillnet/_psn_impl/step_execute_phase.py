@@ -255,10 +255,17 @@ class StepExecutePhaseMixin:
                         continue
                 except Exception:
                     continue
-            # Register the helper as an experimental node (no LLM, no checkpoint).
+            # Register the helper as an experimental node. Pass task="" (not the
+            # current task): the helper is a generic utility, and letting the
+            # parent task drive its intent-based effect extraction would taint it
+            # with the parent's target effect (e.g. a pure name-resolver extracted
+            # under "Craft 1 wooden pickaxe" would be advertised as producing a
+            # wooden_pickaxe, so the matcher recommends it as the crafter and the
+            # agent crafts nothing). The helper's effects must come from its own
+            # code only.
             try:
                 final_name, _code = self.skill_manager.pre_register_skill(
-                    name=name, code=h["standalone_code"], task=self.task
+                    name=name, code=h["standalone_code"], task=""
                 )
             except Exception as e:
                 print(f"\033[33m[Register-at-birth] pre_register failed for '{name}': {e}\033[0m")

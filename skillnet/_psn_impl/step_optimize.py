@@ -569,15 +569,20 @@ class StepOptimizeMixin:
                 res = skill_lang.validate_syntax(migrated)
                 if not getattr(res, "valid", False):
                     return
+            # task="" so the parent task does not taint the extracted helper's
+            # intent-based effect extraction (a generic helper would otherwise be
+            # advertised as producing the parent task's target item).
             final_name, _code = self.skill_manager.pre_register_skill(
-                name=inline, code=helper["standalone_code"], task=self.task
+                name=inline, code=helper["standalone_code"], task=""
             )
             if final_name and final_name != inline:
                 migrated = re.sub(rf'\b{re.escape(inline)}\s*\(', f"{final_name}(", migrated)
             # Update the ancestor to call the extracted skill. pre_register_skill is
             # the light path (no LLM description regeneration, tolerant of an LLM
             # outage) and rebuilds the ancestor->culprit edge from the migrated code.
-            self.skill_manager.pre_register_skill(name=ancestor, code=migrated, task=self.task)
+            # task="" because this is a behavior-preserving refactor (inline def ->
+            # external call), not a new task intent for the ancestor.
+            self.skill_manager.pre_register_skill(name=ancestor, code=migrated, task="")
             print(f"\033[36m[Candidate] materialized inline culprit '{final_name or inline}' from '{ancestor}'\033[0m")
         except Exception as e:
             print(f"\033[33m[Candidate] materialize inline culprit failed: {e}\033[0m")
