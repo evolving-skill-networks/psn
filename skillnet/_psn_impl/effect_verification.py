@@ -156,9 +156,15 @@ class EffectVerificationMixin:
                     delta = post_count - pre_count
 
                     if operation == "add":
-                        if delta >= expected_count:
+                        # Achieved when the goal quantity is PRESENT after
+                        # execution -- whether the skill added it now or it was
+                        # already satisfied (idempotent). post_count >= expected
+                        # subsumes the delta>=expected "added enough" case (pre>=0)
+                        # and, unlike a pure delta check, does not need the LLM to
+                        # rescue idempotent skills.
+                        if post_count >= expected_count:
                             item_achieved = True
-                            effect_details.append(f"{check_item} +{delta}")
+                            effect_details.append(f"{check_item}={post_count} (+{delta})")
                             break
                     elif operation == "remove":
                         if -delta >= expected_count:
@@ -280,6 +286,23 @@ class EffectVerificationMixin:
             rule_passed = (primary_achieved == primary_checked)
         else:
             rule_passed = (effects_achieved > 0)
+
+        # A concrete, measurable primary effect (inventory/equipment/dimension/
+        # nearby_block) that was NOT achieved is AUTHORITATIVE: the skill
+        # demonstrably did not fulfil its declared primary purpose and the goal is
+        # not already satisfied. Do NOT let the LLM fallback rationalize it as
+        # success -- that is exactly what let a no-op name-resolver carrying a
+        # stray "produces wooden_pickaxe" primary effect be marked achieved ->
+        # skill_success -> is_verified=True, locking a permanently broken skill in
+        # as verified and protected from deletion. The LLM is only consulted when
+        # there were NO measurable primary effects to check (primary_checked == 0,
+        # e.g. block effects or no structured state_representation).
+        if primary_checked > 0 and not rule_passed:
+            reason = (
+                f"Primary effect not achieved ({primary_achieved}/{primary_checked} "
+                f"primaries; inventory changes: {state_changes['inventory_changes']})"
+            )
+            return False, reason, state_changes
 
         if rule_passed:
             reason = (
