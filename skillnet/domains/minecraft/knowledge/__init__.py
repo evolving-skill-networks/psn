@@ -84,8 +84,15 @@ class MinecraftKnowledge(DomainKnowledge):
     def get_runtime_primitive_names(self) -> List[str]:
         from skillnet.domains.minecraft.action_space.control_primitives import (
             load_control_primitive_names,
+            load_control_primitive_function_names,
         )
-        return load_control_primitive_names()
+        # File stems (e.g. "useChest") AND the top-level functions each primitive
+        # file defines (e.g. "depositItemIntoChest", "moveToChest"). Both are in
+        # runtime skill scope, so both must be recognized by the validators and
+        # protected from being shadowed by a same-named skill.
+        names = list(load_control_primitive_names())
+        names.extend(sorted(load_control_primitive_function_names()))
+        return names
 
     _skill_language_impl = None  # class-level cache: one Babel-loading instance per process
 
@@ -327,7 +334,15 @@ class MinecraftKnowledge(DomainKnowledge):
             PATTERN_SUPPORTED_VALUES, OVERCLAIM_SEMANTIC_CONTEXTS,
             LOOP_BREAK_API_HINTS, KNOWN_PATHFINDER_GOALS,
         )
-        helpers = set(CONTROL_PRIMITIVE_HELPERS)
+        from skillnet.domains.minecraft.action_space.control_primitives import (
+            load_control_primitive_function_names,
+        )
+        # The top-level functions each control-primitive file defines (e.g.
+        # depositItemIntoChest/moveToChest in useChest.js) are callable from skill
+        # scope at runtime but were absent from every static whitelist, so the
+        # function-reference validator rejected calls to them as undefined and the
+        # agent kept reinventing the primitive. Surface them as known helpers.
+        helpers = set(CONTROL_PRIMITIVE_HELPERS) | load_control_primitive_function_names()
         return {
             "bot_methods": set(BOT_METHODS),
             "primitives": set(KNOWN_PRIMITIVES),

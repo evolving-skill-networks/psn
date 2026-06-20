@@ -14,6 +14,39 @@ def load_control_primitive_names():
     ]
 
 
+_PRIMITIVE_FUNCTION_NAMES = None
+
+
+def load_control_primitive_function_names():
+    """Return the set of TOP-LEVEL function names defined across all control
+    primitive .js files (e.g. ``depositItemIntoChest``, ``moveToChest`` defined
+    inside useChest.js).
+
+    The primitive sources are concatenated verbatim into the runtime `programs`
+    blob, so every top-level ``[async] function NAME`` they declare is hoisted
+    into skill scope and is genuinely callable from skill code. The static
+    validators only knew the file STEMS (``useChest``), so calls to these inner
+    functions were wrongly flagged as undefined, forcing skills to reinvent the
+    primitive instead of reusing it. Only column-0 declarations are returned
+    (nested helpers are indented and not in skill scope). Cached per process.
+    """
+    global _PRIMITIVE_FUNCTION_NAMES
+    if _PRIMITIVE_FUNCTION_NAMES is None:
+        import re
+        pat = re.compile(r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", re.M)
+        names = set()
+        for fname in os.listdir(_PRIMITIVES_DIR):
+            if not fname.endswith(".js") or fname.startswith("."):
+                continue
+            try:
+                src = U.load_text(f"{_PRIMITIVES_DIR}/{fname}")
+            except Exception:
+                continue
+            names.update(pat.findall(src))
+        _PRIMITIVE_FUNCTION_NAMES = names
+    return set(_PRIMITIVE_FUNCTION_NAMES)
+
+
 def load_control_primitives(primitive_names=None):
     """Load control primitive JavaScript source code.
 
