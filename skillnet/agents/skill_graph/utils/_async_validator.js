@@ -109,13 +109,39 @@ function calleeToName(callee, callPath) {
   return null;
 }
 
+// Methods whose callback RETURN VALUE escapes to the caller: value-collecting
+// iterations (map/flatMap collect into an array, usually for Promise.all) and
+// promise-chain methods (then/catch/finally chain the returned promise). A call
+// returned out of such a callback is NOT fire-and-forget — its promise is handed
+// to the consumer, which can await it. (forEach/filter/reduce are deliberately
+// excluded: forEach discards the value, filter wants a boolean, reduce an acc.)
+const RETURN_ESCAPING_METHODS = new Set(["map", "flatMap", "then", "catch", "finally"]);
+
+// If `fnPath` (an arrow/function expression) is the callback ARGUMENT of a
+// CallExpression whose method is return-escaping, return that host CallExpression
+// path so the climb can continue from it (e.g. await Promise.all(arr.map(fn))).
+function returnEscapingHostCall(fnPath) {
+  if (!fnPath) return null;
+  const parent = fnPath.parentPath;
+  if (parent && parent.node.type === "CallExpression" &&
+      parent.node.arguments.includes(fnPath.node) &&
+      parent.node.callee.type === "MemberExpression" &&
+      parent.node.callee.property &&
+      RETURN_ESCAPING_METHODS.has(parent.node.callee.property.name)) {
+    return parent;
+  }
+  return null;
+}
+
 // Climb up from a CallExpression node; determine if the whole expression
-// is eventually awaited (either directly or after a .then/.catch/.finally chain
-// or inside a Promise.all call that is awaited).
+// is eventually awaited (either directly, after a .then/.catch/.finally chain,
+// inside a Promise.all call that is awaited, or RETURNED out of a value-collecting
+// callback whose host iteration is itself awaited).
 function isAwaited(callPath) {
   let p = callPath;
   while (p && p.parentPath) {
     const parent = p.parentPath.node;
+    const parentPath = p.parentPath;
     if (parent.type === "AwaitExpression") return true;
     // Chain: X().then(...) — keep going up
     if (parent.type === "MemberExpression" && parent.object === p.node) {
@@ -137,9 +163,37 @@ function isAwaited(callPath) {
         continue;
       }
     }
+    // The promise is RETURNED out of a callback: `(x) => CALL` (expression body)
+    // or `(x) => { return CALL; }` (block body). If that callback is passed to a
+    // return-escaping method (map/flatMap/then/...), continue from the host call
+    // so an outer `await Promise.all(arr.map(fn))` / awaited chain clears it.
+    let returnedFnPath = null;
+    if (parent.type === "ArrowFunctionExpression" && parent.body === p.node) {
+      returnedFnPath = parentPath;
+    } else if (parent.type === "ReturnStatement" && parent.argument === p.node) {
+      returnedFnPath = enclosingFunctionPath(parentPath);
+    }
+    if (returnedFnPath) {
+      const host = returnEscapingHostCall(returnedFnPath);
+      if (host) { p = host; continue; }
+    }
     break;
   }
   return false;
+}
+
+// Climb to the nearest enclosing arrow/function expression PATH (not declaration
+// boundary semantics — just the lexical container), starting from `path`.
+function enclosingFunctionPath(path) {
+  let p = path && path.parentPath;
+  while (p) {
+    const t = p.node.type;
+    if (t === "ArrowFunctionExpression" || t === "FunctionExpression" || t === "FunctionDeclaration") {
+      return p;
+    }
+    p = p.parentPath;
+  }
+  return null;
 }
 
 // Does the expression have .then/.catch/.finally anywhere in its chain?
