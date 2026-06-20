@@ -2635,7 +2635,17 @@ class SkillGraphManager(
         
         print(f"\033[33mSkill {program_name} added to graph. "
               f"Graph now has {len(self.graph.nodes)} skills.\033[0m")
-    
+
+        # Return the final (possibly renamed) skill name so callers can detect
+        # success. Without this the success path fell through to an implicit None,
+        # indistinguishable from the reject paths' explicit `return None`; callers
+        # that branch on the return (HelperExtractor.extract_and_register) then
+        # treated every successful registration as a failure and never migrated
+        # the parent to call the newly-registered helper, leaving it a dangling
+        # duplicate. info["program_name"] is mutated in place on rename, so this
+        # matches what the node was registered under.
+        return info.get("program_name", program_name)
+
     def _invoke_llm_with_stats(
         self,
         messages,
