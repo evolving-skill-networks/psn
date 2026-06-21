@@ -141,6 +141,61 @@ class PSNCriticAgent(CriticAgent):
 
         return HumanMessage(content=content)
 
+    def _check_deposit_success(self, task_str, events):
+        """Deterministic success criterion for the full-inventory "deposit useless
+        items" task, replacing the critic's improvised <=20-occupied-slots bar
+        (arbitrary and unachievable: a real inventory keeps ~24 slots of
+        tools/ingots). Success iff the canonical low-value/"useless" set
+        (junk blocks, obsolete tools, excess building blocks) has been removed
+        from the POST-execution inventory -- i.e. classify_deposit frees 0 slots.
+        Tools/ingots/valuables are kept by definition, so success no longer depends
+        on a fixed slot count and is aligned with the trigger's classification.
+
+        Returns (success, critique, quality_metrics) or None when this is not a
+        deposit task or the inventory cannot be read (defer to the LLM critic).
+
+        Note: the env exposes no chest-content channel (nearbyChests is empty), so
+        we verify removal-from-inventory, not arrival-in-chest. This is sound for
+        the env's deposit skills, which move items via the chest container API
+        rather than tossing them on the ground.
+        """
+        t = (task_str or "").lower()
+        if "deposit" not in t or "chest" not in t:
+            return None
+        dk = getattr(self, "_domain_knowledge", None)
+        if dk is None:
+            return None
+        try:
+            obs = dk.extract_observation(events)
+            inv = dict(obs.inventory or {})
+            equip = list(obs.extra.get("equipment", [])) if obs.extra else []
+        except Exception:
+            return None
+        if not inv:
+            return None  # no post-inventory observed — let the LLM critic decide
+        try:
+            from skillnet.domains.minecraft.knowledge.inventory_classification import (
+                classify_deposit,
+            )
+            res = classify_deposit(inv, equipment=equip)
+        except Exception:
+            return None
+        quality = {
+            "robustness_score": 70,
+            "dependency_safety": "safe",
+            "environment_awareness": "full",
+        }
+        if res["freed_slots"] == 0:
+            return True, "All low-value items deposited; tools/ingots/valuables kept.", quality
+        remaining = ", ".join(f"{k} x{v}" for k, v in sorted(res["deposit"].items()))
+        return (
+            False,
+            f"Still holding low-value items that should be deposited into the chest "
+            f"(would free {res['freed_slots']} slots): {remaining}. "
+            f"Keep tools/ingots/valuables; deposit only these.",
+            quality,
+        )
+
     def check_task_success(
         self, *, events, task: TaskWithSemantic, context, chest_observation, max_retries=5,
         state_changes=None, executed_skills=None, planned_skills=None, plan_type=None
@@ -175,6 +230,16 @@ class PSNCriticAgent(CriticAgent):
                     "dependency_safety": "unsafe",
                     "environment_awareness": "none",
                 }
+
+        # Deterministic success for the full-inventory deposit task (bypasses the
+        # LLM critic's arbitrary <=20-slot bar; aligned with the deposit
+        # classification used by the trigger).
+        deposit_verdict = self._check_deposit_success(task.task, events)
+        if deposit_verdict is not None:
+            success, critique, quality_metrics = deposit_verdict
+            print(f"\033[35m****PSN Critic (deterministic deposit check): "
+                  f"success={success}\033[0m")
+            return success, critique, quality_metrics
 
         # Render the message (using the extended render_human_message)
         human_message = self.render_human_message(

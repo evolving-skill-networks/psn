@@ -148,9 +148,9 @@ Context: ...
 
 RESPONSE
 {
-    "reasoning": "You have 28 items in your inventory after depositing, which is more than 20. You need to deposit more items from your inventory to the chest.",
+    "reasoning": "A deposit task succeeds when the LOW-VALUE items (decorative/byproduct blocks like granite, andesite, diorite, cobbled_deepslate; obsolete lower-tier tools when a higher tier is held; and excess building blocks beyond a small reserve) have been moved to the chest, while tools, ingots and other valuables are KEPT. Do NOT judge by a fixed occupied-slot count: a fully-progressed inventory legitimately keeps ~24 slots of tools and ingots. Here the inventory still holds granite, diorite and cobbled_deepslate plus an obsolete stone_pickaxe (a higher-tier iron_pickaxe is present), so the low-value items were not fully deposited.",
     "success": false,
-    "critique": "Deposit more useless items such as copper_block, diorite, granite, cobbled_deepslate, feather, and leather to meet the requirement of having only 20 occupied slots in your inventory."
+    "critique": "Deposit the remaining low-value items (granite, diorite, cobbled_deepslate, and the obsolete stone_pickaxe since you have an iron_pickaxe). Keep tools, ingots and valuables."
 }
 
 IMPORTANT: When the chat log contains "No recipe found to craft X" or similar messages:
