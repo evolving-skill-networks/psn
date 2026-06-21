@@ -851,6 +851,36 @@ class PSNCurriculumAgent(
             print(f"\033[33m[PSN] Failed to get task context (LLM may be unreachable): {e}\033[0m")
             base_context = ""
 
+        # For a deposit/full-inventory task, attach the canonical list of items to
+        # deposit (computed from the current inventory + worn gear). This is the
+        # single source of truth shared with the full-inventory trigger, so the
+        # action agent deposits exactly the low-progression-value items (junk,
+        # obsolete tools, excess building blocks) and keeps tools/ingots/valuables,
+        # instead of relying on an ad-hoc per-skill whitelist.
+        _tl = (task or "").lower()
+        if "deposit" in _tl and "chest" in _tl:
+            try:
+                from skillnet.domains.minecraft.knowledge.inventory_classification import (
+                    classify_deposit,
+                )
+                inv = dict(getattr(self.resource_tracker, "current_inventory", {}) or {})
+                worn = []
+                try:
+                    _dk = getattr(self, "_domain_knowledge", None)
+                    _obs = _dk.extract_observation(events) if _dk else None
+                    worn = list(_obs.extra.get("equipment", [])) if (_obs and _obs.extra) else []
+                except Exception:
+                    worn = []
+                dep = classify_deposit(inv, equipment=worn)["deposit"]
+                if dep:
+                    items_str = ", ".join(f"{k} x{v}" for k, v in sorted(dep.items()))
+                    base_context += (
+                        f"\nDeposit ONLY these low-value items into the chest "
+                        f"(keep everything else, especially tools/ingots/valuables): {items_str}"
+                    )
+            except Exception:
+                pass
+
         # Add feasibility info
         feasibility = self.goal_planner.check_feasibility(TaskWithSemantic.from_legacy_string(task))
         if not feasibility.is_feasible:

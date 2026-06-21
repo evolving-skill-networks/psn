@@ -216,9 +216,20 @@ class TaskValidationMixin:
                 print(f"\033[35m[PSN Equipment] Armor upgrade: {equip_task}\033[0m")
                 return equip_task
 
-            # Inventory full — threshold from domain config
+            # Inventory full — threshold from domain config. Only short-circuit to
+            # a deposit task when there is actually something worth depositing;
+            # otherwise fall through to the normal milestone/exploration flow so a
+            # full-of-keepers inventory cannot loop on the deposit task.
             if inventory_slots_used >= full_threshold:
-                return self._handle_full_inventory(inventory, chest_observation)
+                worn = []
+                try:
+                    _obs = dk.extract_observation(events) if dk else None
+                    worn = list(_obs.extra.get("equipment", [])) if (_obs and _obs.extra) else []
+                except Exception:
+                    worn = []
+                full_task = self._handle_full_inventory(inventory, chest_observation, equipment=worn)
+                if full_task:
+                    return full_task
 
         except Exception as e:
             print(f"[PSN] Warning in special case check: {e}")
@@ -279,15 +290,30 @@ class TaskValidationMixin:
     def _handle_full_inventory(
         self,
         inventory: Dict[str, int],
-        chest_observation: str
-    ) -> str:
-        """Handle full inventory by delegating to domain knowledge."""
+        chest_observation: str,
+        equipment: list = None,
+    ) -> Optional[str]:
+        """Handle a full inventory by delegating to domain knowledge.
+
+        Depositability-aware: returns a deposit/chest task ONLY when the canonical
+        classification finds something worth depositing (>=1 slot freeable). If the
+        inventory is full of items that should all be KEPT (tools/ingots/valuables),
+        there is nothing to deposit, so we return None and let the normal flow
+        proceed — this is what makes the deposit loop escapable without a separate
+        failure-count guard.
+        """
         dk = getattr(self, '_domain_knowledge', None)
-        if dk:
-            task = dk.get_full_inventory_task(inventory, chest_observation)
-            if task:
-                return task
-        return "Free up inventory space"
+        if not dk:
+            return None
+        try:
+            from skillnet.domains.minecraft.knowledge.inventory_classification import (
+                classify_deposit,
+            )
+            if classify_deposit(inventory, equipment=equipment)["freed_slots"] < 1:
+                return None  # nothing useful to deposit — do not issue a deposit task
+        except Exception:
+            pass  # classification unavailable: fall back to legacy behavior
+        return dk.get_full_inventory_task(inventory, chest_observation)
 
     def _has_sufficient_materials_for_milestone(self, inventory: Dict[str, int]) -> bool:
         """Check if we have sufficient raw materials for early-game progression.

@@ -1489,7 +1489,11 @@ HELPER FUNCTION GUIDELINES:
         return has_enough
 
     def get_inventory_config(self) -> dict:
-        return {"stack_size": 64, "total_slots": 36, "full_threshold": 27}
+        # full_threshold 30/36: only treat the inventory as "full" when <=6 free
+        # slots remain. The previous 27 (75% full) fired the deposit flow far too
+        # eagerly — on a fragmented-but-not-full inventory — which combined with a
+        # narrow deposit set to re-issue the deposit task indefinitely.
+        return {"stack_size": 64, "total_slots": 36, "full_threshold": 30}
 
     def get_equipment_slot_names(self) -> list:
         return ["head", "torso", "legs", "feet", "hand", "off-hand"]
