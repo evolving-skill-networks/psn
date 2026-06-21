@@ -7,13 +7,20 @@ You will receive the COMPLETE CODE with changes marked. This format shows the en
 - Lines starting with "[+]" are ADDED code
 - Lines with "... // (X unchanged lines)" indicate collapsed unchanged sections
 
+WHAT "CONSISTENT" MEANS (read carefully):
+The consistency check exists ONLY to catch THRASH/REGRESSION — a change that
+CONTRADICTS, REVERTS, or RE-BREAKS something a recent feedback asked to fix. It is
+NOT a completeness check. A change is INCONSISTENT only if it makes things worse
+relative to the feedback, never merely because it fails to address a feedback.
+
 IMPORTANT GUIDELINES:
 1. You can see the FULL CODE STRUCTURE - use this to understand how changes fit into the overall logic
 2. Focus on lines marked with [-] (deletions) and [+] (additions)
-3. Check if the changes actually FIX the issues mentioned in feedback
+3. Judge CONTRADICTION, not completeness: mark inconsistent ONLY if the change undoes a prior fix, re-introduces a previously-reported bug, or directly worsens an issue a feedback raised.
 4. Consider how changes interact with surrounding unchanged code
-5. A change that doesn't address the feedback is NOT necessarily a conflict - it just means the optimization might be incomplete
-6. **CRITICAL**: If the UNCHANGED code (lines with "[ ]") ALREADY implements what the feedback asks for, then this is NOT a conflict!
+5. **Incompleteness is NOT inconsistency.** A change that does not address a feedback — or that fixes a DIFFERENT, deeper root cause than the symptom a feedback named — is still CONSISTENT. Feedbacks are hints, not mandatory constraints; the optimizer may legitimately fix the true root cause instead of the symptom. Do NOT lower the score for failing to address a feedback.
+6. **Adding error handling / throwing on a genuine failure is NOT a regression**, and replacing fragile inline logic with a call to a correct external helper/primitive (e.g. one that navigates before acting) is a valid fix, not a conflict — even if a feedback asked to "relax/remove" an error that the new approach handles differently.
+7. **CRITICAL**: If the UNCHANGED code (lines with "[ ]") ALREADY implements what the feedback asks for, then this is NOT a conflict!
    - Example: If feedback asks to "check return value", but the unchanged code already has "if (!result) { throw... }", then the feedback is ALREADY SATISFIED
    - In such cases, the new changes are still consistent, even if they don't add return value checking (because it's already there)
 
@@ -26,10 +33,12 @@ Return a JSON object:
   "explanation": "brief explanation of how changes relate to feedback"
 }
 
-Note: consistent=true means the changes don't contradict the feedback AND the overall code (unchanged + changed) satisfies the feedback.
-An optimization is "consistent" if:
-1. The changes don't make things worse, OR
-2. The existing unchanged code already satisfies the feedback (so no change was needed for that issue)
+Note: consistent=true means the changes do NOT contradict, revert, or re-break anything a recent feedback fixed. consistent=false is reserved for genuine regressions/contradictions.
+An optimization is "consistent" (consistent=true) if ANY of these hold:
+1. The changes don't make any feedback's issue worse (even if they don't fully address it — incompleteness is fine), OR
+2. The changes fix a deeper root cause than the symptom a feedback described, OR
+3. The existing unchanged code already satisfies the feedback (so no change was needed for that issue).
+consistency_score should reflect how strongly the change CONTRADICTS recent feedback: ~1.0 when it contradicts nothing (including a correct root-cause fix that ignores a symptom feedback), low ONLY for a real regression. Do NOT score low for incompleteness.
 
 === HUMAN ===
 Skill: {skill_name}
