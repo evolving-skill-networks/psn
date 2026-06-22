@@ -56,13 +56,11 @@ class AgentLLMs:
 @dataclass
 class ActionConfig:
     """Action agent behavior configuration."""
-    # Per-task retry budget. Optimizer cycles between attempts can take 2+
-    # attempts to produce a committable code version (Phase 1 attribution +
-    # Phase 2 patch validation each contribute latency). At 4 retries the
-    # optimizer's first successful version typically lands too late to be
-    # exercised before curriculum gives up; 5 retries gives one extra
-    # attempt to run whatever the optimizer just committed.
-    task_max_retries: int = 5
+    # Per-task retry budget: max attempts before curriculum gives up on a task.
+    # Each retry can include an optimizer cycle (Phase 1 attribution + Phase 2
+    # patch validation add latency), so a just-committed fix may only get
+    # exercised on the following attempt; lowering this tightens that slack.
+    task_max_retries: int = 4
     show_chat_log: bool = True
     show_execution_error: bool = True
     use_llm_for_normalization: bool = True
