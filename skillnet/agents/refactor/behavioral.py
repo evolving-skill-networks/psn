@@ -276,6 +276,9 @@ class BehavioralRefactor(SkillRefactor):
             if self.skill_graph_manager:
                 from skillnet.agents.optimizer.validators import check_naming_conflicts
                 existing_skill_names = set(self.skill_graph_manager.get_all_skill_names(include_task_specific=True))
+                # The refactored skill legitimately redefines its own function; only
+                # shadowing a DIFFERENT skill is a conflict.
+                existing_skill_names.discard(source_skill)
                 no_conflict, conflict_messages = check_naming_conflicts(new_code, existing_skill_names)
                 if not no_conflict:
                     self._log(

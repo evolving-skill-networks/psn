@@ -898,6 +898,11 @@ Analyze why the function fails for certain parameter values and fix accordingly.
 
         # ===== Fix 12: naming-conflict detection =====
         existing_skill_names = set(self.skill_graph_manager.get_all_skill_names(include_task_specific=True))
+        # A skill's own code legitimately defines `function <skill_name>(...)`; only
+        # redefining a DIFFERENT skill is a real shadowing conflict. Without this
+        # exclusion, optimizing a skill flags its own definition as a conflict with
+        # itself and the optimization is permanently rejected.
+        existing_skill_names.discard(skill_name)
         no_conflict, conflict_messages = check_naming_conflicts(optimized_code, existing_skill_names)
         if not no_conflict:
             self.logger.error(f"\033[31m[Quick Optimize] Naming conflict detection failed:\033[0m")
