@@ -108,17 +108,14 @@ class MetadataValidationMixin:
                 })
                 result["total_effects_removed"] += (before_count - after_count)
 
-                # Also update the separate effects file
+                # Also update the separate effects file. Use the shared serializer
+                # so is_primary / condition are preserved here too -- the minimal
+                # dict this path used to write dropped them, which would strip the
+                # primary/by-product distinction (and the param-bound marker) from
+                # any skill whose effects were trimmed on load.
                 try:
                     effects_file = f"{self.ckpt_dir}/skill_graph/effects/{name}.json"
-                    effects_data = [
-                        {
-                            "description": s.description,
-                            "code": s.code,
-                            "state_representation": s.state_representation
-                        }
-                        for s in validated
-                    ]
+                    effects_data = self._serialize_effects(validated)
                     U.dump_json(effects_data, effects_file)
                 except (IOError, OSError, TypeError) as e:
                     print(f"\033[31m[Effect Cleanup] Failed to save {name} effects: {e}\033[0m")
@@ -127,17 +124,30 @@ class MetadataValidationMixin:
 
     def _repair_missing_primary_effects(self: "SkillGraphManager") -> Dict[str, Any]:
         """
-        Repair wrapper skills that are missing primary effects on checkpoint load.
+        Repair skills that are missing primary effects on checkpoint load.
 
-        Wrapper skills (e.g., craftWoodenPickaxe → craftWoodenTool) often lose their
-        primary effect during LLM-based effect inference because the LLM sees no direct
-        craftItem() call. This method infers the primary effect from the skill name and
-        validates it against MC item names.
+        Two cases:
+
+        1. GENERAL skills produced by sibling refactoring (e.g. craftWoodenTool,
+           covering craftWoodenAxe / craftWoodenPickaxe). Their product is
+           parameter-selected, so the fixed sibling product effects get stripped
+           by ``_validate_effects_against_code`` and name inference cannot recover
+           it (``craftWoodenTool`` -> ``wooden_tool``, not a real item). Here we
+           reconstruct an OR product primary from the *covered siblings' own*
+           primary products -- the reliable source -- bound to the product
+           parameter so it survives validation. This is what keeps EffectMatcher
+           from mis-matching by-products.
+
+        2. Ordinary wrapper/leaf skills that lost their primary during LLM-based
+           effect inference. Fall back to name inference (the original behaviour).
 
         Returns:
-            Dict with "repaired_skills" list of {"skill": name, "item": item_name}
+            Dict with "repaired_skills" list of {"skill": name, "item": item(s)}
         """
-        from skillnet.agents.skill_graph.metadata.effects import infer_primary_effect_from_name
+        from skillnet.agents.skill_graph.metadata.effects import (
+            infer_primary_effect_from_name,
+            synthesize_general_primary_effect,
+        )
 
         result = {"repaired_skills": []}
 
@@ -152,28 +162,107 @@ class MetadataValidationMixin:
             if has_primary:
                 continue
 
-            # Try to infer from name
-            inferred = infer_primary_effect_from_name(name)
+            # Case 1: a general skill -> reconstruct from the covered siblings.
+            inferred = None
+            sibling_products, param_name = self._collect_sibling_products(name, node)
+            if sibling_products:
+                inferred = synthesize_general_primary_effect(sibling_products, param_name)
+
+            # Case 2: fall back to name inference for ordinary skills.
+            if inferred is None:
+                inferred = infer_primary_effect_from_name(name)
             if not inferred:
                 continue
 
-            # Idempotency: check no effect already covers this item
-            inferred_item = inferred.state_representation.get("item")
-            existing_items = {
-                e.state_representation.get("item")
-                for e in node.expected_effects
-                if e.state_representation
-            }
-            if inferred_item in existing_items:
+            # Idempotency: skip if the existing effects already cover the item(s).
+            inferred_items = self._effect_items(inferred)
+            existing_items = set()
+            for e in node.expected_effects:
+                existing_items |= self._effect_items(e)
+            if inferred_items and inferred_items <= existing_items:
                 continue
 
             node.expected_effects.append(inferred)
             result["repaired_skills"].append({
                 "skill": name,
-                "item": inferred_item,
+                "item": sorted(inferred_items) if inferred_items else None,
             })
 
         return result
+
+    def _collect_sibling_products(self, general_name: str, node) -> "Tuple[List[str], Optional[str]]":
+        """For a GENERAL skill, gather the union of its covered siblings' primary
+        product items and the product-selecting parameter name.
+
+        Siblings are the skills whose ``covered_by`` points at this general skill;
+        post-refactor each retains its own ``is_primary`` product effect (e.g.
+        craftWoodenAxe keeps ``+wooden_axe``). Returns ``([], None)`` when this is
+        not a general skill or no sibling products can be found.
+        """
+        siblings = [
+            n for n in self.graph.nodes.values()
+            if getattr(n, 'covered_by', None) == general_name
+        ]
+        if not getattr(node, 'is_general_skill', False) and not siblings:
+            return [], None
+
+        from skillnet.agents.skill_graph.metadata.effects import infer_primary_effect_from_name
+
+        products: List[str] = []
+        for sib in siblings:
+            sib_items = []
+            for e in (getattr(sib, 'expected_effects', None) or []):
+                if getattr(e, 'is_primary', False):
+                    sib_items.extend(self._effect_items(e))
+            if not sib_items:
+                # The sibling is a wrapper now; its primary may have been
+                # transiently stripped by effect-validation and not yet re-added
+                # (repair order is not guaranteed). Recover its product from its
+                # OWN name -- which, unlike the general skill's name, is a valid
+                # item (craftWoodenAxe -> wooden_axe). This makes reconstruction
+                # independent of the order repair visits general vs sibling skills.
+                inf = infer_primary_effect_from_name(getattr(sib, 'name', '') or '')
+                if inf is not None:
+                    sib_items.extend(self._effect_items(inf))
+            products.extend(sib_items)
+        products = list(dict.fromkeys(p for p in products if p))
+        if not products:
+            return [], None
+        return products, self._infer_product_param_name(node)
+
+    @staticmethod
+    def _infer_product_param_name(node) -> str:
+        """Pick the parameter that selects a general skill's product (e.g.
+        ``toolType``). Prefer an input-semantic parameter that the code actually
+        uses (so the reconstructed primary survives ``_effect_is_param_implemented``
+        on the next validation pass); fall back to parsing the function signature."""
+        code = getattr(node, 'code', '') or ''
+        params = getattr(node, 'parameters', None) or {}
+        _CONFIGISH = {
+            'count', 'amount', 'quantity', 'total', 'targettotal',
+            'maxdistance', 'craftingtablemaxdistance', 'preferredplank', 'plankvariant',
+        }
+        best, best_score = None, -1
+        for pname, meta in params.items():
+            if not isinstance(pname, str) or not pname:
+                continue
+            md = meta if isinstance(meta, dict) else {}
+            blob = f"{md.get('semantic', '')} {md.get('direction', '')}".lower()
+            score = 0
+            if 'input' in blob:
+                score += 2
+            if pname.lower() not in _CONFIGISH:
+                score += 1
+            if code and re.search(rf'\b{re.escape(pname)}\b', code):
+                score += 3
+            if score > best_score:
+                best, best_score = pname, score
+        if best is not None:
+            return best
+        m = re.search(r'function\s+\w+\s*\(\s*bot\s*,\s*(\w+)', code)
+        if m:
+            return m.group(1)
+        return 'toolType'
 
     def _fix_function_name_mismatch_on_load(self: "SkillGraphManager") -> Dict[str, Any]:
         """
@@ -320,6 +409,17 @@ class MetadataValidationMixin:
         warnings = []
 
         for effect in effects:
+            # Parameter-bound product effects on GENERAL skills (e.g.
+            # craftWoodenTool's primary, an OR over {wooden_axe, wooden_pickaxe}
+            # selected by `toolType`) never contain the product literal in the
+            # parametric code -- the crafted item is chosen via the parameter. The
+            # literal-implementation checks below would always discard them,
+            # leaving the general skill with no primary effect. Exempt such effects
+            # when their bound parameter is actually used by the code.
+            if self._effect_is_param_implemented(effect, code):
+                validated.append(effect)
+                continue
+
             # Check OR logic in state_representation
             state_repr = getattr(effect, 'state_representation', None)
 
@@ -347,6 +447,45 @@ class MetadataValidationMixin:
                     print(f"\033[33m[Effect Validation] Discarding unimplemented effect: {effect.description[:60]}...\033[0m")
 
         return validated, warnings
+
+    @staticmethod
+    def _effect_items(effect) -> set:
+        """Collect the item names an effect concerns (handles scalar and OR/AND
+        logic state_representations)."""
+        sr = getattr(effect, 'state_representation', None)
+        if not isinstance(sr, dict):
+            return set()
+        if "conditions" in sr and isinstance(sr.get("conditions"), list):
+            items = set()
+            for cond in sr["conditions"]:
+                if isinstance(cond, dict) and cond.get("item"):
+                    items.add(cond["item"])
+            return items
+        return {sr["item"]} if sr.get("item") else set()
+
+    @staticmethod
+    def _effect_is_param_implemented(effect, code: str) -> bool:
+        """Whether an effect is a parameter-bound product whose selecting
+        parameter is actually used by the code.
+
+        General skills produced by sibling refactoring carry a primary product
+        effect bound to a parameter (``effect.condition = {param_name: [...]}``);
+        the product item is chosen at call time via that parameter, so the
+        parametric code never contains the product literal. Such an effect is
+        "implemented via the parameter" when the bound parameter name appears as
+        an identifier in the code. This is intentionally narrow: effects without a
+        ``condition`` (the overwhelming majority) are never exempted, so genuine
+        hallucinations are still discarded by the literal-implementation checks.
+        """
+        cond = getattr(effect, 'condition', None)
+        if not isinstance(cond, dict) or not cond:
+            return False
+        code = code or ""
+        for param_name in cond:
+            if isinstance(param_name, str) and param_name and \
+                    re.search(rf'\b{re.escape(param_name)}\b', code):
+                return True
+        return False
 
     def _validate_or_effect_conditions(
         self: "SkillGraphManager",

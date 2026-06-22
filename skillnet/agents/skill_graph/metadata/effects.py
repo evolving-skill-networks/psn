@@ -259,6 +259,67 @@ def infer_primary_effect_from_name(skill_name: str) -> Optional[SkillEffect]:
     )
 
 
+def synthesize_general_primary_effect(
+    products: List[str], param_name: str
+) -> Optional[SkillEffect]:
+    """
+    Build a parameter-bound primary product effect for a parameterized GENERAL
+    skill created by sibling refactoring (e.g. craftWoodenTool over the siblings
+    craftWoodenAxe / craftWoodenPickaxe).
+
+    A general skill's product is parameter-dependent: the crafted item is selected
+    by ``param_name`` (e.g. ``toolType``), so the parametric code contains no
+    literal product name. A fixed item effect therefore cannot represent the
+    product and would be stripped by ``_validate_effects_against_code`` (the
+    "not implemented in code" rule), leaving the skill with no primary effect --
+    which lets EffectMatcher's no-primary fallback mis-match intermediate
+    by-products.
+
+    Instead we record the product as an OR over the union of the siblings' product
+    items, marked ``is_primary=True`` and parameter-bound via ``condition`` so that
+    (a) EffectMatcher prefers it over by-products, and (b) effect-validation
+    recognises it as implemented-via-parameter (see
+    ``MetadataValidationMixin._effect_is_param_implemented``).
+
+    Args:
+        products: the siblings' primary product item names,
+                  e.g. ``["wooden_axe", "wooden_pickaxe"]``.
+        param_name: the product-selecting parameter, e.g. ``"toolType"``.
+
+    Returns:
+        ``SkillEffect(is_primary=True)``, or ``None`` if no products are given.
+    """
+    items = [p for p in dict.fromkeys(products or []) if p]
+    if not items:
+        return None
+    if len(items) == 1:
+        state_representation = {
+            "type": "inventory", "item": items[0], "count": 1, "operation": "add",
+        }
+    else:
+        state_representation = {
+            "logic": "OR",
+            "conditions": [
+                {"type": "inventory", "item": it, "count": 1, "operation": "add"}
+                for it in items
+            ],
+        }
+    condition = {param_name: list(items)} if param_name else None
+    return SkillEffect(
+        description=(
+            f"Produces the requested wooden tool ({' / '.join(items)}), "
+            f"selected by parameter '{param_name}'."
+        ),
+        code="",
+        state_representation=state_representation,
+        is_primary=True,
+        importance="core",
+        confidence_level="inferred",
+        condition=condition,
+        inference_stats={"validation_method": "sibling_product_union"},
+    )
+
+
 # ============================================================================
 # EffectExtractor Class
 # ============================================================================

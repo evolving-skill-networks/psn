@@ -977,15 +977,7 @@ class SkillGraphManager(
             
             # Save effects
             effects_file = f"{self.ckpt_dir}/skill_graph/effects/{name}.json"
-            effects_data = [
-                {
-                    "description": s.description,
-                    "code": s.code,
-                    "state_representation": s.state_representation if s.state_representation else {},
-                    "is_primary": getattr(s, 'is_primary', False)
-                }
-                for s in node.expected_effects
-            ]
+            effects_data = self._serialize_effects(node.expected_effects)
             U.dump_json(effects_data, effects_file)
             
             # Save full skill metadata (graph properties, statistics, etc.)

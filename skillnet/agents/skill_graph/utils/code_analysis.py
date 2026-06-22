@@ -824,6 +824,19 @@ def serialize_effects(effects: List["SkillEffect"]) -> List[Dict[str, Any]]:
         }
         if effect.state_representation:
             effect_dict["state_representation"] = effect.state_representation
+        # Persist the fields the matcher and effect-validation depend on. Dropping
+        # is_primary loses the primary/by-product distinction; dropping condition
+        # loses the parameter-bound marker that exempts a general skill's product
+        # primary from the literal-implementation check (see
+        # MetadataValidationMixin._effect_is_param_implemented). Without these the
+        # synthesized general-skill primary would decay across a save/load cycle.
+        effect_dict["is_primary"] = getattr(effect, 'is_primary', False)
+        importance = getattr(effect, 'importance', None)
+        if importance:
+            effect_dict["importance"] = importance
+        condition = getattr(effect, 'condition', None)
+        if condition:
+            effect_dict["condition"] = condition
         result.append(effect_dict)
     return result
 

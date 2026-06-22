@@ -283,6 +283,55 @@ class SiblingRefactor(SkillRefactor):
                         seen_precond_keys.add(key)
                         propagated_preconds.append(_copy.deepcopy(pre))
 
+            # ───────────────────────────────────────────────────────────────────
+            # Synthesize the general skill's PRIMARY product effect.
+            #
+            # The siblings' own product effects (e.g. +wooden_axe / +wooden_pickaxe)
+            # were propagated above, but they are FIXED items on a PARAMETRIC skill:
+            # downstream _validate_effects_against_code strips them (the parametric
+            # code crafts via the `toolType` parameter and contains no literal
+            # product name), leaving the general skill with NO primary effect. That
+            # lets EffectMatcher's no-primary fallback mis-match an intermediate
+            # by-product.
+            #
+            # Record the product as a parameter-bound OR over the siblings' products
+            # so it survives validation (_effect_is_param_implemented) and the
+            # matcher prefers it. Replace the fixed sibling primaries with this one.
+            # (Repair-on-load reconstructs the same primary for already-broken
+            # checkpoints, per _repair_missing_primary_effects.)
+            # ───────────────────────────────────────────────────────────────────
+            sibling_products = []
+            for sib_node in skill_nodes.values():
+                for eff in (sib_node.expected_effects or []):
+                    if not getattr(eff, 'is_primary', False):
+                        continue
+                    sr = getattr(eff, 'state_representation', None) or {}
+                    if isinstance(sr, dict):
+                        if isinstance(sr.get('conditions'), list):
+                            sibling_products += [
+                                c.get('item') for c in sr['conditions'] if isinstance(c, dict)
+                            ]
+                        elif sr.get('item'):
+                            sibling_products.append(sr.get('item'))
+            sibling_products = [p for p in dict.fromkeys(sibling_products) if p]
+            if sibling_products:
+                from skillnet.agents.skill_graph.metadata.effects import (
+                    synthesize_general_primary_effect,
+                )
+                general_primary = synthesize_general_primary_effect(
+                    sibling_products, plan.param_name
+                )
+                if general_primary is not None:
+                    propagated_effects = [
+                        e for e in propagated_effects if not getattr(e, 'is_primary', False)
+                    ]
+                    propagated_effects.append(general_primary)
+                    self._log(
+                        f"[Sibling] Layer1: synthesized param-bound product primary for "
+                        f"{general_name}: {sibling_products} via '{plan.param_name}'",
+                        "info",
+                    )
+
             if propagated_effects:
                 general_node.expected_effects = propagated_effects
                 self._log(
